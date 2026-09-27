@@ -366,16 +366,22 @@ function formatOag(atomic) {
   return frac ? `${whole}.${frac}` : `${whole}`;
 }
 
-function drawAddresses() {
+// What each address holds: everything, how many outputs, and how much of it
+// can be spent now (a mined reward waits to mature).
+function holdings() {
   const per = new Map();
   for (const coin of state.coins) {
     if (!coin.address) continue;
-    const entry = per.get(coin.address) || { atomic: 0n, count: 0 };
+    const entry = per.get(coin.address) || { atomic: 0n, count: 0, spendable: 0n };
     entry.atomic += BigInt(coin.amount);
     entry.count += 1;
+    if (mature(coin)) entry.spendable += BigInt(coin.amount);
     per.set(coin.address, entry);
   }
+  return per;
+}
 
+function drawAddresses(per) {
   const shown = $("recv-addr").textContent;
   const list = $("addr-list");
   list.textContent = "";
@@ -460,16 +466,52 @@ function draw() {
       ? `showing 200 of ${state.count}`
       : `${state.count}`;
   show("do-sweep", usable.length >= 2);
-  drawAddresses();
+  const per = holdings();
+  drawAddresses(per);
+  fillSendFrom(per);
 }
 
-function usableCoins() {
-  return state.coins.filter((c) => c.address);
+// "Any" spends from every address, as before. Choosing one spends only its
+// coins and sends the change back to it, so addresses kept apart stay apart.
+// Only addresses holding coins are offered; a choice already made is kept.
+function fillSendFrom(per) {
+  const box = $("send-from");
+  const chosen = box.value;
+  let all = 0n;
+  for (const entry of per.values()) all += entry.spendable;
+  const any = document.createElement("option");
+  any.value = "";
+  any.textContent = `any address — ${formatOag(all)} OAG spendable`;
+  const options = [any];
+  state.addresses.forEach((address, n) => {
+    const held = per.get(address);
+    if (!held && address !== chosen) return;
+    const option = document.createElement("option");
+    option.value = address;
+    const short = `${address.slice(0, 12)}…${address.slice(-6)}`;
+    option.textContent = `#${n + 1} ${short} — ${formatOag(held ? held.spendable : 0n)} OAG spendable`;
+    options.push(option);
+  });
+  box.replaceChildren(...options);
+  box.value = options.some((o) => o.value === chosen) ? chosen : "";
+  noteSendFrom();
+}
+
+function noteSendFrom() {
+  $("send-from-note").textContent = $("send-from").value
+    ? "Only this address's coins are spent, and the change comes back to it."
+    : "Coins may be taken from any address; the change goes to address #1.";
+}
+
+// Coins this wallet can sign for, narrowed to one address when `from` is given.
+function usableCoins(from) {
+  return state.coins.filter((c) => c.address && (!from || c.address === from));
 }
 
 async function doSend() {
   const to = $("send-to").value.trim();
   const amount = $("send-amount").value.trim();
+  const from = $("send-from").value;
   say("send-msg", "", false);
   await working($("do-send"), "signing…", async () => {
     try {
@@ -480,7 +522,9 @@ async function doSend() {
         amount,
         fee_rate: chain.feerate,
         next_height: chain.height + 1,
-        coins: usableCoins(),
+        coins: usableCoins(from),
+        // Empty means the wallet's default, as before.
+        change: from,
       });
       const sent = await ask("/api/send", { hex: signed.hex });
       $("send-to").value = $("send-amount").value = "";
@@ -536,6 +580,7 @@ function doLock() {
   call({ cmd: "lock" });
   state = fresh();
   $("addr-list").textContent = "";
+  $("send-from").textContent = "";
   show("wallet", false);
   show("gate", true);
   say("gate-msg", "", false);
@@ -642,6 +687,7 @@ document.addEventListener("DOMContentLoaded", () => {
   $("do-new").onclick = doCreate;
   $("do-restore").onclick = doRestore;
   $("do-send").onclick = doSend;
+  $("send-from").onchange = noteSendFrom;
   $("do-sweep").onclick = doSweep;
   $("do-sign").onclick = doSign;
   $("do-verify").onclick = doVerify;

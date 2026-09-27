@@ -3060,6 +3060,20 @@ while everything looks the same.
 Listening on anything but loopback therefore requires a certificate. Without one,
 **startup is refused.** For local experimentation plaintext is fine.
 
+#### A chosen sender MUST get the change back
+
+The send screen lets the user spend from any address, or from one address only.
+When one is chosen, **only that address's outputs are spent, and the change goes
+back to that address.** Sending the change to the default address (index 0)
+would mix addresses the user was keeping apart, and defeat the choice.
+
+The change address **MUST be one this wallet holds the key for**. Any other is
+refused before anything is built, since one typo would hand the change to
+someone else.
+
+When no sender is chosen, any output may be spent and the change goes to the
+default address, as before.
+
 #### Storage is not a backup
 
 The encrypted record goes in localStorage. But that is **a cache, not a backup.**

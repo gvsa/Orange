@@ -268,11 +268,24 @@ fn cmd_pay(request: &Value) -> Result<Value, String> {
 
     with_open(|store| {
         let coins = coins_field(request)?;
-        let change_to = Lock::from_address(
-            &store
-                .default_address()
-                .map_err(|e| format!("cannot look up the change address: {e}"))?,
-        );
+        // 送り元を選んだ画面は、お釣りもそこへ戻す。既定のアドレスへ
+        // 戻すと、分けて使っていたアドレスが混ざる。
+        // **自分の鍵を持たないアドレスには戻さない。** 打ち間違い一つで
+        // お釣りが他人のものになる。
+        let change_to = match request.get("change").and_then(Value::as_str) {
+            Some(text) if !text.is_empty() => {
+                let lock = parse_lock(store.network(), text)?;
+                if store.key_for(&lock).is_none() {
+                    return Err("the change address is not one of this wallet's".into());
+                }
+                lock
+            }
+            _ => Lock::from_address(
+                &store
+                    .default_address()
+                    .map_err(|e| format!("cannot look up the change address: {e}"))?,
+            ),
+        };
         let spend = Spend {
             to,
             amount,
@@ -624,6 +637,41 @@ mod tests {
         // 種も鍵も応答に混ざっていない。
         let text = paid.to_string();
         assert!(!text.contains("phrase") && !text.contains("seed"), "{text}");
+    }
+
+    /// 送り元を選んだときは、お釣りがそのアドレスへ戻る。
+    #[test]
+    fn change_goes_back_to_the_address_it_is_told() {
+        make_wallet();
+        let grown = ok(r#"{"cmd":"grow","accounts":3}"#);
+        let list = grown["addresses"].as_array().unwrap();
+        let (first, third) = (list[0].as_str().unwrap(), list[2].as_str().unwrap());
+
+        let pay = |change: &str| {
+            json!({
+                "cmd": "pay", "network": "regtest", "to": first, "amount": "1",
+                "fee_rate": "50000000000", "next_height": 200, "change": change,
+                "coins": [{
+                    "txid": "44".repeat(32), "index": 0, "amount": "100000000000000000",
+                    "height": 10, "coinbase": true, "address": third,
+                }],
+            })
+        };
+        let paid = ok(&serde_json::to_string(&pay(third)).unwrap());
+        let raw = hex::decode(paid["hex"].as_str().unwrap()).unwrap();
+        let tx = oag_consensus::Transaction::decode(&raw).unwrap();
+        let back = Lock::from_address(&Address::decode(third).unwrap());
+        assert!(
+            tx.outputs.iter().any(|o| o.lock == back),
+            "no change came back to the chosen address"
+        );
+
+        // 自分の鍵を持たないアドレスへは戻さない。
+        let stranger = Address::new(Network::Regtest, 0, vec![7u8; 32])
+            .unwrap()
+            .encode();
+        let message = err(&serde_json::to_string(&pay(&stranger)).unwrap());
+        assert!(message.contains("not one of this wallet's"), "{message}");
     }
 
     /// コインベースは成熟するまで使えない。**ブラウザでも同じ規則が効く。**

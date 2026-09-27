@@ -209,6 +209,9 @@ footer{padding:20px 16px;color:var(--dim);font-size:12px;text-align:center;borde
   </div>
 
   <div id="pane-send" class="card hidden">
+    <label for="send-from" style="margin-top:0">From</label>
+    <select id="send-from" class="mono"></select>
+    <p id="send-from-note" class="note" style="margin:4px 0 0"></p>
     <label for="send-to">To</label>
     <input id="send-to" autocomplete="off" spellcheck="false" placeholder="oag1…">
     <label for="send-amount">Amount (OAG)</label>
