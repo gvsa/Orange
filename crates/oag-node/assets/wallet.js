@@ -440,6 +440,7 @@ async function boot() {
 
   chain = await ask("/api/info", {});
   $("chain").textContent = `${chain.network} · height ${chain.height}`;
+  show("res-noindex", !chain.indexed);
 
   show("boot", false);
   gateReady();

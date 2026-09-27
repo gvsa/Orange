@@ -179,15 +179,21 @@ enum Command {
         /// one (`docs/SPEC.md` §14.5). Past this depth it can also no longer follow
         /// a reorganisation on its own; recovering means syncing again.
         ///
-        /// It cannot be combined with `--index`, and so not with `--explorer` or
-        /// `--wallet` either: those read transactions out of blocks this would have
-        /// thrown away.
+        /// It cannot be combined with `--index`, and so not with `--explorer`
+        /// either: those read transactions out of blocks this would have thrown
+        /// away.
+        ///
+        /// `--wallet` works, without the index. Balances and sending need only the
+        /// UTXO set, which is kept whole; what goes is the history. Restoring a
+        /// wallet then finds addresses by their unspent outputs alone: addresses
+        /// that were emptied are not listed, and coins beyond 200 emptied
+        /// addresses in a row would be missed.
         ///
         /// Passing it without a number keeps 4320 blocks, three days at one minute
         /// each. The least it accepts is 144.
         #[arg(long, value_name = "blocks", num_args = 0..=1,
               default_missing_value = "4320",
-              conflicts_with_all = ["index", "explorer", "wallet"])]
+              conflicts_with_all = ["index", "explorer"])]
         prune: Option<u64>,
         /// Follow the chain without keeping it. Off by default.
         ///
@@ -454,7 +460,11 @@ fn run() -> Result<(), String> {
 
                 // エクスプローラは索引に頼る。無いまま開いても取引と
                 // アドレスが引けないので、暗黙に作る。
-                if index || explorer.is_some() || wallet.is_some() {
+                //
+                // ウォレットは索引が無くても動く。残高と送金は UTXO セットで
+                // 足り、欠けるのは履歴だけである。**剪定したノードでは作らない。**
+                // 索引は捨てた本体を読みに行くので、作れない。
+                if index || explorer.is_some() || (wallet.is_some() && prune.is_none()) {
                     match handle.index_from().await? {
                         Some(0) => println!("the index already exists"),
                         _ => {
@@ -502,6 +512,12 @@ fn run() -> Result<(), String> {
                     let scheme = if tls.is_some() { "https" } else { "http" };
                     let bound = oag_node::wallet::start_wallet(handle.clone(), addr, tls).await?;
                     println!("wallet open at {scheme}://{bound}/");
+                    if prune.is_some() {
+                        println!(
+                            "the wallet runs without history on a pruned node; balances \
+                             and sending are unaffected"
+                        );
+                    }
                 }
 
                 if !external_addr.is_empty() {

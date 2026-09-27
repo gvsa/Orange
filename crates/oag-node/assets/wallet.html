@@ -124,6 +124,11 @@ footer{padding:20px 16px;color:var(--dim);font-size:12px;text-align:center;borde
     <p class="note">
       After restoring, the chain is queried to find how far the wallet had been used.
     </p>
+    <p id="res-noindex" class="note hidden">
+      This node keeps no history (it runs with --prune), so only coins still
+      unspent are looked at. Every coin you hold is found; addresses you have
+      emptied do not show up.
+    </p>
   </div>
   <div id="pane-verify" class="card hidden">
     <p class="note" style="margin-top:0">

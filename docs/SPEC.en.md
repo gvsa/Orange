@@ -2931,6 +2931,12 @@ belongs to everyone and the chain's contents are public. Opening these does not
 widen what the node can do. **No endpoint that touches keys or changes settings
 MUST be added.**
 
+`/api/history` needs the index; the other three need only the UTXO set. On a
+pruned node, which cannot build the index, the wallet runs without history and
+`/api/info` says so. Restoring then finds used addresses by their unspent
+outputs alone: an address that was emptied is not found, but coins still held
+are, unless 200 emptied addresses in a row come before them.
+
 #### The implementation MUST NOT be duplicated
 
 The browser side loads `oag-wallet` compiled to wasm. Key derivation, record
@@ -3457,8 +3463,8 @@ unable to make a single connection.
 
 `oag-node` enables it with `--prune <blocks>`; leaving the number out keeps
 4320. It prunes bodies and rollback data to the same depth, so it cannot be
-combined with `--prune-undo`, nor with `--index`, `--explorer` or `--wallet`,
-which need the index. The shallowest depth it accepts is 144; below that the
+combined with `--prune-undo`, nor with `--index` or `--explorer`, which need
+the index. `--wallet` runs without the index (§16.9). The shallowest depth it accepts is 144; below that the
 one- and two-block reorganisations of ordinary operation would leave it stuck.
 
 #### A light node is built first without changing the protocol
