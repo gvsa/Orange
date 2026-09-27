@@ -34,6 +34,11 @@ padding:10px 12px;white-space:nowrap}
 .ok{color:#2a7;font-size:13px}
 .mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;word-break:break-all}
 .hidden{display:none !important}
+/* A txid or an error can be one long word. Let it wrap instead of pushing
+   the whole page sideways on a phone. */
+main p{overflow-wrap:anywhere}
+/* iOS zooms into any field under 16px when it is tapped. */
+select.mono{font-size:16px}
 .utxo{display:flex;justify-content:space-between;gap:10px;padding:8px 0;border-bottom:1px solid var(--line)}
 .utxo:last-child{border-bottom:0}
 .utxo .who{min-width:0}

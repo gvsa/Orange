@@ -481,26 +481,35 @@ function fillSendFrom(per) {
   for (const entry of per.values()) all += entry.spendable;
   const any = document.createElement("option");
   any.value = "";
-  any.textContent = `any address — ${formatOag(all)} OAG spendable`;
+  any.textContent = "any address";
   const options = [any];
   state.addresses.forEach((address, n) => {
     const held = per.get(address);
     if (!held && address !== chosen) return;
     const option = document.createElement("option");
     option.value = address;
-    const short = `${address.slice(0, 12)}…${address.slice(-6)}`;
-    option.textContent = `#${n + 1} ${short} — ${formatOag(held ? held.spendable : 0n)} OAG spendable`;
+    // Short enough for a phone. The exact amount goes under the box, where
+    // it has room; a select cuts its text off without saying so.
+    option.textContent = `#${n + 1} ${address.slice(0, 10)}…${address.slice(-6)}`;
     options.push(option);
   });
   box.replaceChildren(...options);
   box.value = options.some((o) => o.value === chosen) ? chosen : "";
+  sendable = new Map([["", all], ...[...per].map(([address, held]) => [address, held.spendable])]);
   noteSendFrom();
 }
 
+// What each choice in "From" can spend right now, for the line under it.
+let sendable = new Map();
+
 function noteSendFrom() {
-  $("send-from-note").textContent = $("send-from").value
-    ? "Only this address's coins are spent, and the change comes back to it."
-    : "Coins may be taken from any address; the change goes to address #1.";
+  const from = $("send-from").value;
+  const can = `${formatOag(sendable.get(from) || 0n)} OAG can be spent now. `;
+  $("send-from-note").textContent =
+    can +
+    (from
+      ? "Only this address's coins are spent, and the change comes back to it."
+      : "Coins may be taken from any address; the change goes to address #1.");
 }
 
 // Coins this wallet can sign for, narrowed to one address when `from` is given.
