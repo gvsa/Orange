@@ -2578,7 +2578,7 @@ separate interface means loosening one does not loosen the other.
 
 - Verbs `GET` and `HEAD` only; everything else is refused
 - Paths `/`, `/block/<height|hash>`, `/tx/<txid>`, `/address/<address>`,
-  `/mempool`, `/search?q=`
+  `/mempool`, `/stats`, `/search?q=`
 - Request headers up to 8 KB; one request per connection
 
 **Both paths and queries are strings the user chooses.** Every value embedded in
@@ -2591,6 +2591,25 @@ Transaction and address lookups depend on the index ([§19](#settled-items)). On
 node without one, **display "not held" rather than an empty history.** An empty
 view is read by the user as "there are no transactions". Browsing blocks works
 without an index.
+
+#### Statistics (`/stats`)
+
+Days running (since block 1), the average block interval, the hashrate, the
+number of addresses holding coins, the number that have ever mined, the numbers
+that mined or received in the last 7 days, and the number of transactions.
+
+- **The hashrate is an estimate.** The expected number of hashes per block is
+  the difficulty itself, so the difficulties of the last n blocks are summed and
+  divided by the time those n blocks took, with n at 60 (about an hour) and 1440
+  (about a day). Dividing by a single block is at the mercy of luck
+- **A count of addresses is not a count of people.** One person can hold many
+  addresses and several can share one. The page says so
+- The genesis block is left out of every count: its time is not when the chain
+  started, and its reward is burned
+- What has been counted is remembered, and later only new blocks are added. If
+  the remembered tip has left the chain, everything is counted again. Addresses
+  holding coins come from a full scan of the UTXO set, so that is redone only
+  when the tip moves
 
 #### List history oldest-first
 

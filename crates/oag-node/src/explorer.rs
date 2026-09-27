@@ -28,14 +28,17 @@
 //! 打ち切った」ことを利用者に隠したまま行うには危うい。
 
 use crate::service::{NodeHandle, TxRecord};
+use crate::stats::{self, Tally};
 use oag_consensus::lock::Lock;
 use oag_consensus::{Block, Transaction};
 use oag_primitives::{Address, Amount, Hash, Network};
 use std::fmt::Write as _;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Mutex;
 
 /// 要求の頭の上限。
 const MAX_REQUEST: usize = 8 * 1024;
@@ -48,6 +51,16 @@ const PAGE: usize = 50;
 /// アドレス頁に出す UTXO の上限。
 const MAX_UTXOS: usize = 500;
 
+/// 接続をまたいで持つもの。
+struct Shared {
+    handle: NodeHandle,
+    /// 鎖の統計。数えたところまでを覚えておき、次は足すだけにする。
+    tally: Mutex<Tally>,
+    /// UTXO セットのまとめと、それを数えたときの先端。先端が動くまでは
+    /// 数え直さない。全件走査なので、頁を開くたびに走らせない。
+    utxo: Mutex<Option<(Hash, oag_store::UtxoSummary)>>,
+}
+
 /// 待ち受けを始める。実際に結びついた住所を返す。
 pub async fn start_explorer(handle: NodeHandle, addr: SocketAddr) -> Result<SocketAddr, String> {
     let listener = TcpListener::bind(addr)
@@ -56,6 +69,21 @@ pub async fn start_explorer(handle: NodeHandle, addr: SocketAddr) -> Result<Sock
     let bound = listener
         .local_addr()
         .map_err(|e| format!("cannot determine the address: {e}"))?;
+
+    let shared = Arc::new(Shared {
+        handle,
+        tally: Mutex::new(Tally::new()),
+        utxo: Mutex::new(None),
+    });
+
+    // 統計を先に数えておく。最初に頁を開いた人を待たせない。
+    let warm = shared.clone();
+    tokio::spawn(async move {
+        let mut tally = warm.tally.lock().await;
+        if let Err(e) = stats::catch_up(&mut tally, &warm.handle).await {
+            crate::log_warn!("cannot count the chain statistics: {e}");
+        }
+    });
 
     tokio::spawn(async move {
         loop {
@@ -66,9 +94,9 @@ pub async fn start_explorer(handle: NodeHandle, addr: SocketAddr) -> Result<Sock
                     return;
                 }
             };
-            let handle = handle.clone();
+            let shared = shared.clone();
             tokio::spawn(async move {
-                let _ = serve_connection(stream, handle).await;
+                let _ = serve_connection(stream, shared).await;
             });
         }
     });
@@ -81,7 +109,7 @@ struct Response {
     body: String,
 }
 
-async fn serve_connection(mut stream: TcpStream, handle: NodeHandle) -> std::io::Result<()> {
+async fn serve_connection(mut stream: TcpStream, shared: Arc<Shared>) -> std::io::Result<()> {
     stream.set_nodelay(true)?;
     let mut buffer = Vec::with_capacity(1024);
 
@@ -101,7 +129,7 @@ async fn serve_connection(mut stream: TcpStream, handle: NodeHandle) -> std::io:
         }
     };
 
-    let response = route(&handle, &target).await;
+    let response = route(&shared, &target).await;
     write_response(&mut stream, &response).await
 }
 
@@ -156,7 +184,8 @@ async fn write_response(stream: &mut TcpStream, response: &Response) -> std::io:
 
 // ━━━━━━━━ 経路 ━━━━━━━━
 
-async fn route(handle: &NodeHandle, target: &str) -> Response {
+async fn route(shared: &Shared, target: &str) -> Response {
+    let handle = &shared.handle;
     let (path, query) = match target.split_once('?') {
         Some((path, query)) => (path, query),
         None => (target, ""),
@@ -165,7 +194,8 @@ async fn route(handle: &NodeHandle, target: &str) -> Response {
     let segments: Vec<&str> = path.trim_matches('/').split('/').collect();
 
     match segments.as_slice() {
-        [""] => overview(handle).await,
+        [""] => overview(shared).await,
+        ["stats"] => stats_page(shared).await,
         ["search"] => search(handle, query).await,
         ["block", rest @ ..] => block_page(handle, &rest.join("/"), query).await,
         ["tx", rest @ ..] => tx_page(handle, &rest.join("/")).await,
@@ -175,7 +205,8 @@ async fn route(handle: &NodeHandle, target: &str) -> Response {
     }
 }
 
-async fn overview(handle: &NodeHandle) -> Response {
+async fn overview(shared: &Shared) -> Response {
+    let handle = &shared.handle;
     let status = match handle.status().await {
         Ok(status) => status,
         Err(e) => return error_page(&e),
@@ -190,6 +221,20 @@ async fn overview(handle: &NodeHandle) -> Response {
     stat(&mut body, "network", &esc(&status.network.to_string()));
     stat(&mut body, "height", &status.height.to_string());
     stat(&mut body, "next difficulty", &group(status.next_difficulty));
+    // **数え終わっていなければ待たない。** 起動直後の数え上げの最中に
+    // 開かれても、トップはすぐに返す。
+    let hashrate = match shared.tally.try_lock() {
+        Ok(mut tally) => {
+            let _ = stats::catch_up(&mut tally, handle).await;
+            tally.hashrate(stats::SHORT_WINDOW)
+        }
+        Err(_) => None,
+    };
+    stat(
+        &mut body,
+        "hashrate (1 h)",
+        &hashrate.map_or_else(|| "—".to_string(), stats::format_hashrate),
+    );
     stat(&mut body, "UTXO", &group(status.utxo_count));
     stat(&mut body, "mempool", &mempool.len().to_string());
     stat(
@@ -253,6 +298,115 @@ async fn overview(handle: &NodeHandle) -> Response {
     }
 
     ok(page("Orange explorer", &body))
+}
+
+async fn stats_page(shared: &Shared) -> Response {
+    let handle = &shared.handle;
+    let status = match handle.status().await {
+        Ok(status) => status,
+        Err(e) => return error_page(&e),
+    };
+
+    let mut tally = shared.tally.lock().await;
+    if let Err(e) = stats::catch_up(&mut tally, handle).await {
+        return error_page(&e);
+    }
+
+    // UTXO セットは先端が動いたときだけ数え直す。
+    let utxo = {
+        let mut cached = shared.utxo.lock().await;
+        match *cached {
+            Some((tip, summary)) if tip == status.tip => summary,
+            _ => match handle.utxo_summary().await {
+                Ok(summary) => {
+                    *cached = Some((status.tip, summary));
+                    summary
+                }
+                Err(e) => return error_page(&e),
+            },
+        }
+    };
+
+    let mut body = String::new();
+    body.push_str(&search_box(""));
+    body.push_str("<h1>statistics</h1>");
+
+    let rate = |blocks| {
+        tally
+            .hashrate(blocks)
+            .map_or_else(|| "—".to_string(), stats::format_hashrate)
+    };
+    let running = match tally.first_time() {
+        Some(first) => {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(first);
+            format!("{:.1} days", (now - first).max(0) as f64 / 86_400.0)
+        }
+        None => "—".to_string(),
+    };
+
+    body.push_str("<h2>chain</h2><div class=\"grid\">");
+    stat(&mut body, "running", &running);
+    stat(&mut body, "blocks", &group(status.height));
+    stat(
+        &mut body,
+        "average block time",
+        &tally
+            .average_interval()
+            .map_or_else(|| "—".to_string(), |s| format!("{s:.1} s")),
+    );
+    stat(&mut body, "hashrate (1 h)", &rate(stats::SHORT_WINDOW));
+    stat(&mut body, "hashrate (24 h)", &rate(stats::LONG_WINDOW));
+    stat(&mut body, "next difficulty", &group(status.next_difficulty));
+    body.push_str("</div>");
+
+    body.push_str("<h2>people</h2><div class=\"grid\">");
+    stat(&mut body, "addresses holding coins", &group(utxo.holders));
+    stat(
+        &mut body,
+        "addresses that have mined",
+        &group(tally.miners() as u64),
+    );
+    stat(
+        &mut body,
+        "mined in the last 7 days",
+        &group(tally.recent_miners() as u64),
+    );
+    stat(
+        &mut body,
+        "received in the last 7 days",
+        &group(tally.recent_receivers() as u64),
+    );
+    stat(&mut body, "transactions", &group(tally.transactions()));
+    stat(
+        &mut body,
+        "coins unspent",
+        &format!("{} OAG", esc(&atomic_to_oag(utxo.total))),
+    );
+    body.push_str("</div>");
+
+    body.push_str("<div class=\"wrap\"><table class=\"kv\">");
+    if let Some(first) = tally.first_time() {
+        row_raw(
+            &mut body,
+            "block 1",
+            &format!("<a href=\"/block/1\">{}</a> UTC", utc(first)),
+        );
+    }
+    row(&mut body, "unspent outputs", &group(utxo.outputs));
+    body.push_str("</table></div>");
+
+    body.push_str(
+        "<p class=\"note\">The hashrate is an estimate: the work the difficulty asks for, \
+         divided by the time the blocks took. An address is counted once however many \
+         blocks or coins it has; one person can hold many addresses, and several people \
+         can share one. Transactions do not include mining rewards. The genesis block is \
+         left out of every count.</p>",
+    );
+
+    ok(page("statistics", &body))
 }
 
 async fn search(handle: &NodeHandle, query: &str) -> Response {
@@ -877,7 +1031,7 @@ fn page(title: &str, body: &str) -> String {
          <meta name=\"robots\" content=\"noindex, nofollow\">\
          <title>{title} · Orange</title><style>{css}</style></head>\
          <body><header><a class=\"brand\" href=\"/\">Orange <span>OAG</span></a>\
-         <nav><a href=\"/\">overview</a> <a href=\"/mempool\">mempool</a></nav></header>\
+         <nav><a href=\"/\">overview</a> <a href=\"/stats\">stats</a> <a href=\"/mempool\">mempool</a></nav></header>\
          <main>{body}</main>\
          <footer>A local, read-only explorer. It cannot send coins or change settings.</footer>\
          </body></html>",

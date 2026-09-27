@@ -345,6 +345,8 @@ enum Request {
         max: usize,
         reply: oneshot::Sender<Result<Vec<UtxoRecord>, String>>,
     },
+    /// UTXO セットを支払い先ごとにまとめる。
+    UtxoSummary(oneshot::Sender<Result<oag_store::UtxoSummary, String>>),
     /// 索引がどの高さから作られているか。
     IndexFrom(oneshot::Sender<Result<Option<u64>, String>>),
     /// txid から確定した取引を引く。索引が要る。
@@ -822,6 +824,11 @@ impl NodeHandle {
             reply,
         })
         .await
+    }
+
+    /// UTXO セットを支払い先ごとにまとめる。全件を走査する。
+    pub async fn utxo_summary(&self) -> Result<oag_store::UtxoSummary, String> {
+        self.ask(Request::UtxoSummary).await
     }
 
     /// 支払い条件が一致する UTXO を集める。
@@ -1582,6 +1589,15 @@ impl Service {
                             .map(|(outpoint, entry)| UtxoRecord { outpoint, entry })
                             .collect()
                     })
+                    .map_err(|e| e.to_string());
+                let _ = reply.send(result);
+            }
+            Request::UtxoSummary(reply) => {
+                let result = self
+                    .node
+                    .chain()
+                    .store()
+                    .utxo_summary()
                     .map_err(|e| e.to_string());
                 let _ = reply.send(result);
             }

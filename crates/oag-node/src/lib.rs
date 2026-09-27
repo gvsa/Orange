@@ -10,6 +10,7 @@
 //! - [`portmap`] — ルーターに待ち受けのポートを開けてもらう (UPnP / NAT-PMP)
 //! - [`rpc`] — JSON-RPC の手続き
 //! - [`seeds`] — 最初の繋ぎ先 (DNS シード)
+//! - [`stats`] — 鎖の統計 (エクスプローラの `/stats`)
 //!
 //! 実行ファイルは `main.rs` にあり、ここを呼ぶだけの薄い層である。
 //! 束ねる部分を library に置いているのは、**2 台のノードを実際に繋いだ
@@ -30,6 +31,7 @@ pub mod portmap;
 pub mod rpc;
 pub mod seeds;
 pub mod service;
+pub mod stats;
 pub mod wallet;
 
 use oag_net::magic::magic_for;
