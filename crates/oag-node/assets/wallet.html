@@ -37,6 +37,11 @@ padding:10px 12px;white-space:nowrap}
 .utxo{display:flex;justify-content:space-between;gap:10px;padding:8px 0;border-bottom:1px solid var(--line)}
 .utxo:last-child{border-bottom:0}
 .utxo .who{min-width:0}
+.addr{align-items:center}
+.addr .much{text-align:right;white-space:nowrap}
+.addr .much .note{display:block;font-size:11px}
+.addr button{flex:0 0 auto;padding:5px 10px;font-size:12px}
+.pill.on{border-color:var(--accent);color:var(--accent)}
 .pill{display:inline-block;font-size:11px;padding:1px 7px;border-radius:999px;
 border:1px solid var(--line);color:var(--dim);margin-left:6px}
 .phrase{display:grid;grid-template-columns:repeat(auto-fill,minmax(130px,1fr));gap:6px;margin-top:10px}
@@ -198,6 +203,9 @@ footer{padding:20px 16px;color:var(--dim);font-size:12px;text-align:center;borde
     <p class="note" style="margin-top:14px">
       While it is open, this page can sign. <b>Lock it</b> when you step away.
     </p>
+    <p class="note" style="margin:18px 0 4px"><b>All addresses of this wallet</b></p>
+    <div id="addr-list"></div>
+    <p id="addr-note" class="note"></p>
   </div>
 
   <div id="pane-send" class="card hidden">

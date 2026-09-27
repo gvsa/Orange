@@ -17,9 +17,22 @@ const WINDOW = 200;
 // Anyone who handed out this many addresses is better off bringing the record along.
 const WINDOWS = 25;
 
+// How often the page asks the node for the height. Blocks come about once a
+// minute, so this sees each one within half a block.
+const POLL_MS = 30 * 1000;
+// Atomic units per OAG. Same as `oag_primitives::ATOMIC_PER_OAG`.
+const DECIMALS = 16;
+
 let wasm = null;
 let chain = null;
-let state = { addresses: [], coins: [], total: "0", truncated: false, count: 0 };
+let state = fresh();
+// One refresh at a time. A poll that lands during a send joins it rather
+// than racing it.
+let refreshing = null;
+
+function fresh() {
+  return { addresses: [], coins: [], total: "0", truncated: false, count: 0, used: new Set() };
+}
 
 // ======== wasm ========
 
@@ -293,14 +306,120 @@ async function enterWallet(addresses) {
   await refresh();
 }
 
-async function refresh() {
-  const scanned = await ask("/api/scan", { addresses: state.addresses });
+// `history` also asks which addresses were ever used. The poll leaves it out:
+// an address that gains coins shows as used from its coins anyway, and asking
+// the index for every address twice a minute is wasted work on a shared node.
+function refresh(history = true) {
+  if (!refreshing) {
+    refreshing = load(history).finally(() => {
+      refreshing = null;
+    });
+  }
+  return refreshing;
+}
+
+async function load(history) {
+  const mine = state;
+  const addresses = state.addresses;
+  const scanned = await ask("/api/scan", { addresses });
+  let used = null;
+  if (history && chain.indexed) {
+    used = (await ask("/api/history", { addresses, max: 1 })).used;
+  }
+  const info = await ask("/api/info", {});
+  // Locked (and perhaps reopened) while this was on its way: drop the answer.
+  if (state !== mine) return;
   state.coins = scanned.utxos;
   state.total = scanned.totaloag;
   state.count = scanned.count;
   state.truncated = scanned.truncated;
-  chain = await ask("/api/info", {});
+  if (used) for (const entry of used) state.used.add(entry.address);
+  setChain(info);
   draw();
+}
+
+function setChain(info) {
+  chain = info;
+  $("chain").textContent = `${chain.network} · height ${chain.height}`;
+}
+
+// The height is kept current while the page is open. Balances are fetched
+// again only when a new block arrived, and only while the wallet is open and
+// the tab is in view.
+async function poll() {
+  if (document.hidden || refreshing) return;
+  try {
+    const before = chain.height;
+    const info = await ask("/api/info", {});
+    setChain(info);
+    if (state.addresses.length > 0 && info.height !== before) await refresh(false);
+  } catch (e) {
+    $("chain").textContent = `${chain.network} · height ${chain.height} · node not reachable`;
+  }
+}
+
+// "12.5" from atomic units, trailing zeros dropped, as the node writes it.
+function formatOag(atomic) {
+  const unit = 10n ** BigInt(DECIMALS);
+  const whole = atomic / unit;
+  const frac = (atomic % unit).toString().padStart(DECIMALS, "0").replace(/0+$/, "");
+  return frac ? `${whole}.${frac}` : `${whole}`;
+}
+
+function drawAddresses() {
+  const per = new Map();
+  for (const coin of state.coins) {
+    if (!coin.address) continue;
+    const entry = per.get(coin.address) || { atomic: 0n, count: 0 };
+    entry.atomic += BigInt(coin.amount);
+    entry.count += 1;
+    per.set(coin.address, entry);
+  }
+
+  const shown = $("recv-addr").textContent;
+  const list = $("addr-list");
+  list.textContent = "";
+  // Newest first: the one handed out last is the one most likely looked for.
+  const all = state.addresses.map((address, n) => [address, n]).reverse();
+  for (const [address, n] of all.slice(0, 200)) {
+    const held = per.get(address);
+    const row = document.createElement("div");
+    row.className = "utxo addr";
+
+    const who = document.createElement("div");
+    who.className = "who mono";
+    who.textContent = `#${n + 1} ${address}`;
+    const pill = document.createElement("span");
+    if (address === shown) {
+      pill.className = "pill on";
+      pill.textContent = "shown above";
+    } else {
+      pill.className = "pill";
+      pill.textContent = held || state.used.has(address) ? "used" : "unused";
+    }
+    who.append(pill);
+
+    const much = document.createElement("div");
+    much.className = "much";
+    much.textContent = `${held ? formatOag(held.atomic) : "0"} OAG`;
+    const coins = document.createElement("span");
+    coins.className = "note";
+    coins.textContent = held ? `${held.count} ${held.count === 1 ? "output" : "outputs"}` : "";
+    much.append(coins);
+
+    const copy = document.createElement("button");
+    copy.textContent = "Copy";
+    copy.onclick = () => navigator.clipboard.writeText(address);
+
+    row.append(who, much, copy);
+    list.append(row);
+  }
+
+  const notes = [];
+  if (all.length > 200) notes.push(`showing the newest 200 of ${all.length}`);
+  if (state.truncated) notes.push("the scan hit its limit, so some balances are short");
+  if (!chain.indexed) notes.push("this node keeps no history, so an emptied address shows as unused");
+  $("addr-note").textContent = notes.join(" · ");
 }
 
 function mature(coin) {
@@ -341,6 +460,7 @@ function draw() {
       ? `showing 200 of ${state.count}`
       : `${state.count}`;
   show("do-sweep", usable.length >= 2);
+  drawAddresses();
 }
 
 function usableCoins() {
@@ -414,7 +534,8 @@ async function doNewAddress() {
 
 function doLock() {
   call({ cmd: "lock" });
-  state = { addresses: [], coins: [], total: "0", truncated: false, count: 0 };
+  state = fresh();
+  $("addr-list").textContent = "";
   show("wallet", false);
   show("gate", true);
   say("gate-msg", "", false);
@@ -438,12 +559,16 @@ async function boot() {
   call({ cmd: "seed", bytes: hex(seed) });
   seed.fill(0);
 
-  chain = await ask("/api/info", {});
-  $("chain").textContent = `${chain.network} · height ${chain.height}`;
+  setChain(await ask("/api/info", {}));
   show("res-noindex", !chain.indexed);
 
   show("boot", false);
   gateReady();
+  setInterval(poll, POLL_MS);
+  // Coming back to the tab should not wait up to a whole interval.
+  document.addEventListener("visibilitychange", () => {
+    if (!document.hidden) poll();
+  });
 }
 
 // ======== signing a message ========
