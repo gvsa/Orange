@@ -1447,7 +1447,7 @@ VM を建てるフラグは、構築の前にキャッシュを使った light �
 
 ```
 T = 60                        目標ブロック時間 (秒)
-N = 90                        窓幅 (暫定値)
+N = 90                        窓幅
 k = N × (N + 1) × T / 2
 
 L = 0
@@ -3479,7 +3479,7 @@ MAX_TX_SIZE                 100,000 バイト
 COINBASE_MATURITY           120 ブロック
 MEDIAN_TIME_SPAN            11 ブロック
 MAX_FUTURE_TIME_DRIFT       300 秒
-LWMA_WINDOW (N)             90            (暫定)
+LWMA_WINDOW (N)             90
 MAX_TARGET                  2^256 − 1
 
 ━━━ Proof of Work ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━

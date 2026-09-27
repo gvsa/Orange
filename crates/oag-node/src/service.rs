@@ -1867,6 +1867,17 @@ impl Service {
                 reorg.disconnected.len(),
                 reorg.connected.len()
             );
+            // 受け取ったブロックより先に、手元にあった子孫まで繋がることが
+            // ある。高さは受け取ったブロックではなく、新しい先端から数える。
+            let tip = self
+                .node
+                .chain()
+                .tip()
+                .map(|e| e.height())
+                .unwrap_or(height);
+            for line in crate::log::reorg_detail(reorg, tip) {
+                crate::log_verify!("{line}");
+            }
             self.progress = None;
             return;
         }

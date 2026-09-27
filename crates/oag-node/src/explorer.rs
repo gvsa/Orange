@@ -375,6 +375,9 @@ async fn stats_page(shared: &Shared) -> Response {
     );
     body.push_str("</div>");
 
+    // 採掘の偏り。
+    body.push_str(&miner_shares(&tally, handle.network()));
+
     // 保有の分布。
     body.push_str("<h2>who holds the coins</h2><div class=\"grid\">");
     stat(&mut body, "largest address", &percent(holdings.top1));
@@ -531,6 +534,81 @@ async fn stats_page(shared: &Shared) -> Response {
     );
 
     ok(page("statistics", &body))
+}
+
+/// 直近のブロックを誰が掘ったか。
+///
+/// **5 割を超えた 1 人がいれば、はっきり書く。** 過半の力を持てば、最近の
+/// ブロックを掘り直して自分の支払いを取り消せる。本人に悪意がなくても、
+/// 受け取る側は待つ承認の数を増やすべきで、それを知る場所はここしかない。
+fn miner_shares(tally: &stats::Tally, network: Network) -> String {
+    /// 表に並べる数。残りはまとめて 1 行にする。
+    const ROWS: usize = 10;
+
+    let (all, counted) = tally.block_shares(stats::SHARE_WINDOW);
+    let mut out = String::new();
+    let _ = write!(
+        out,
+        "<h2>who mined the last {} blocks</h2>",
+        group(counted as u64)
+    );
+    if counted == 0 {
+        out.push_str("<p class=\"note\">nothing has been mined yet.</p>");
+        return out;
+    }
+    let share = |n: usize| n as f64 / counted as f64;
+
+    if let Some((_, top)) = all.first() {
+        if *top * 2 > counted {
+            let _ = write!(
+                out,
+                "<p class=\"warn\">One address mined {} of the last {} blocks. \
+                 Whoever has more than half of the hashrate can undo recent blocks, \
+                 their own payments included. For large amounts, wait for more \
+                 confirmations than usual.</p>",
+                percent(share(*top)),
+                group(counted as u64),
+            );
+        }
+    }
+
+    out.push_str(
+        "<div class=\"wrap\"><table class=\"list\"><tr class=\"head\"><th>#</th><th>address</th>\
+         <th class=\"num\">blocks</th><th class=\"num\">share</th></tr>",
+    );
+    for (rank, (lock, blocks)) in all.iter().take(ROWS).enumerate() {
+        let addr = lock
+            .to_address(network)
+            .map(|a| a.to_string())
+            .unwrap_or_else(|_| format!("version {}", lock.version()));
+        let _ = write!(
+            out,
+            "<tr><td data-label=\"#\">{rank}</td>\
+             <td data-label=\"address\" class=\"mono trunc\"><a href=\"/address/{a}\">{short}</a></td>\
+             <td data-label=\"blocks\" class=\"num\">{blocks}</td>\
+             <td data-label=\"share\" class=\"num\">{share}</td></tr>",
+            rank = rank + 1,
+            a = esc(&addr),
+            short = esc(&shorten(&addr)),
+            blocks = group(*blocks as u64),
+            share = percent(share(*blocks)),
+        );
+    }
+    if all.len() > ROWS {
+        let rest: usize = all[ROWS..].iter().map(|(_, n)| n).sum();
+        let _ = write!(
+            out,
+            "<tr><td data-label=\"#\"></td>\
+             <td data-label=\"address\">{} more addresses</td>\
+             <td data-label=\"blocks\" class=\"num\">{}</td>\
+             <td data-label=\"share\" class=\"num\">{}</td></tr>",
+            group((all.len() - ROWS) as u64),
+            group(rest as u64),
+            percent(share(rest)),
+        );
+    }
+    out.push_str("</table></div>");
+    out
 }
 
 async fn richlist_page(shared: &Shared) -> Response {
@@ -1726,6 +1804,44 @@ mod tests {
             },
             transactions,
         }
+    }
+
+    /// `miners` の順に掘られたブロックを数えた集計。同じ番号は同じ鍵。
+    fn tally_mined_by(miners: &[u8]) -> Tally {
+        use oag_primitives::SecretKey;
+        let mut tally = Tally::new();
+        for (i, miner) in miners.iter().enumerate() {
+            let mut block = block_of(1);
+            let secret = SecretKey::from_bytes([*miner; 32]).unwrap();
+            block.transactions[0].outputs[0].lock = Lock::pay_to_pubkey(&secret.public_key());
+            block.header.height = i as u64 + 1;
+            block.header.timestamp += 60 * i as i64;
+            tally.add(&block, Hash::ZERO);
+        }
+        tally
+    }
+
+    #[test]
+    fn a_miner_with_more_than_half_of_the_blocks_is_called_out() {
+        let html = miner_shares(&tally_mined_by(&[1, 1, 1, 2]), Network::Mainnet);
+        assert!(html.contains("the last 4 blocks"), "{html}");
+        assert!(html.contains("class=\"warn\""), "{html}");
+        assert!(html.contains("75.0%"), "{html}");
+    }
+
+    #[test]
+    fn exactly_half_is_not_a_majority() {
+        let html = miner_shares(&tally_mined_by(&[1, 1, 2, 3]), Network::Mainnet);
+        assert!(!html.contains("class=\"warn\""), "{html}");
+        assert!(html.contains("50.0%"), "{html}");
+    }
+
+    #[test]
+    fn miners_beyond_the_first_ten_are_folded_into_one_row() {
+        let miners: Vec<u8> = (1..=12).collect();
+        let html = miner_shares(&tally_mined_by(&miners), Network::Mainnet);
+        assert!(html.contains("2 more addresses"), "{html}");
+        assert_eq!(html.matches("/address/").count(), 10, "{html}");
     }
 
     #[test]

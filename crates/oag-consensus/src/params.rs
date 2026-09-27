@@ -52,7 +52,9 @@ pub const fn block_subsidy(height: u64) -> Amount {
 
 // ━━━ 難易度調整 (SPEC §12) ━━━
 
-/// LWMA の窓幅。**暫定値**。シミュレーションによる検証を要する。
+/// LWMA の窓幅。**確定値**。SPEC §12.2 のシミュレーションと、本番の運用
+/// (採掘者の出入りで難易度が数倍動いた場面を含む) で確かめた。変えれば
+/// ハードフォークになる。
 pub const LWMA_WINDOW: u64 = 90;
 
 /// solvetime をクランプする倍率。`±LWMA_SOLVETIME_CLAMP × T` に制限する。

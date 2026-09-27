@@ -6,6 +6,7 @@
 //! - ハッシュレート (難易度と時刻から逆算した推定)
 //! - 採掘したことのあるアドレスの数、直近 7 日に採掘した数
 //! - 直近 7 日にコインを受け取ったアドレスの数
+//! - 直近 100 ブロックを誰が掘ったか (採掘の偏り)
 //! - 取引の数 (採掘の報酬を除く)
 //! - アドレスごとの残高 (保有の分布、上位の一覧)
 //! - 以上の日ごとの推移 (UTC の日付で区切る)
@@ -46,6 +47,12 @@ pub const RECENT_SECONDS: i64 = 7 * 24 * 60 * 60;
 pub const SHORT_WINDOW: usize = 60;
 /// ハッシュレートの長い窓 (約 1 日)。
 pub const LONG_WINDOW: usize = 1440;
+/// 採掘の偏りを見る窓 (約 1 時間 40 分)。
+///
+/// 短すぎると運に振り回され、長すぎると大きな採掘者が来た・去ったことが
+/// 数字に出るまでに時間がかかる。100 なら 1 人が 5 割を超えたかどうかを
+/// 見るには十分で、半日も遅れない。
+pub const SHARE_WINDOW: usize = 100;
 /// 1 日の秒数。
 const DAY: i64 = 86_400;
 
@@ -429,6 +436,28 @@ impl Tally {
         self.transactions
     }
 
+    /// 直近 `blocks` 個のブロックを、報酬の支払い先ごとに数える。
+    ///
+    /// 返すのは (支払い先, ブロック数) の多い順と、実際に数えたブロック数
+    /// (鎖が短ければ `blocks` より少ない)。1 つのブロックの報酬を複数の
+    /// 支払い先に分けていれば、それぞれに 1 つと数える。同数は支払い条件の
+    /// 符号化の順に並べる。
+    pub fn block_shares(&self, blocks: usize) -> (Vec<(Lock, usize)>, usize) {
+        let counted = blocks.min(self.recent.len());
+        let mut counts: HashMap<&Lock, usize> = HashMap::new();
+        for r in self.recent.range(self.recent.len() - counted..) {
+            let mut seen = HashSet::new();
+            for lock in &r.miners {
+                if seen.insert(lock) {
+                    *counts.entry(lock).or_insert(0) += 1;
+                }
+            }
+        }
+        let mut all: Vec<(Lock, usize)> = counts.into_iter().map(|(l, n)| (l.clone(), n)).collect();
+        all.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.encode().cmp(&b.0.encode())));
+        (all, counted)
+    }
+
     fn distinct_recent(&self, pick: impl Fn(&Recent) -> &Vec<Lock>) -> usize {
         let since = self.tip_time - RECENT_SECONDS;
         let mut seen = HashSet::new();
@@ -590,6 +619,35 @@ mod tests {
         }
         assert_eq!(tally.recent.len(), LONG_WINDOW + 1);
         assert!(tally.hashrate(LONG_WINDOW).is_some());
+    }
+
+    #[test]
+    fn block_shares_count_only_the_last_blocks_largest_first() {
+        let mut tally = Tally::new();
+        tally.add(&block(0, 0, 1, 9, &[]), Hash::ZERO);
+        // 1 が 3 つ、2 が 1 つ、その後に 3 が 2 つ。
+        for (h, miner) in [(1, 1), (2, 1), (3, 2), (4, 1), (5, 3), (6, 3)] {
+            tally.add(&block(h, 1_000 + 60 * h as i64, 1, miner, &[]), Hash::ZERO);
+        }
+
+        let (all, counted) = tally.block_shares(100);
+        assert_eq!(counted, 6);
+        assert_eq!(all, vec![(lock(1), 3), (lock(3), 2), (lock(2), 1)]);
+
+        // 窓を狭めれば、古いブロックは外れる。
+        let (last, counted) = tally.block_shares(3);
+        assert_eq!(counted, 3);
+        assert_eq!(last, vec![(lock(3), 2), (lock(1), 1)]);
+    }
+
+    #[test]
+    fn a_reward_split_into_two_outputs_to_one_address_is_one_block() {
+        let mut tally = Tally::new();
+        let mut b = block(1, 1_000, 1, 1, &[]);
+        let output = b.transactions[0].outputs[0].clone();
+        b.transactions[0].outputs.push(output);
+        tally.add(&b, Hash::ZERO);
+        assert_eq!(tally.block_shares(100), (vec![(lock(1), 1)], 1));
     }
 
     /// 送金の取引。`spend` の出力を使い、`to` へ `oag` を送り、残りを
