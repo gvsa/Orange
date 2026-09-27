@@ -8,6 +8,15 @@
 //! シード ([`crate::seeds`]) を引く。**住所帳に候補がある限り引かない。**
 //! シードは新しく入るときの取っ掛かりであって、常用するものではない。
 //!
+//! # 追いついたのに本数が足りないとき
+//!
+//! 同期の最中は 2 本で足りるので、住所帳が薄いまま追いつくことがある。
+//! そこから [`TARGET_OUTBOUND`] 本まで足そうにも、当てが無ければ足せず、
+//! 2 本のまま居続ける。**追いついていて、本数が足りず、住所帳にも当てが
+//! 無ければ、シードを引く。** 追いついた直後に 1 回、その後は
+//! `THIN_BOOK_SECS` に 1 回までである。答えは他の住所と同じく住所帳の
+//! 規則を通るので、シードの言いなりにはならない。
+//!
 //! # 何本繋ぐか
 //!
 //! [`TARGET_OUTBOUND`] 本。少ないと、繋いだ相手が全員が悪意を持っていた
@@ -80,6 +89,9 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// 先端がこの秒数だけ動かなければ、シードを引き直す。目標間隔の 30 倍。
 const STALE_TIP_SECS: i64 = 30 * 60;
 
+/// 追いついたのに本数が足りないとき、シードを引き直す間隔の下限。
+const THIN_BOOK_SECS: i64 = 30 * 60;
+
 /// いま繋いでいる・繋ぎに行っている外向きの住所。
 #[derive(Debug, Clone, Default)]
 pub struct Outbound(Arc<Mutex<HashSet<SocketAddr>>>);
@@ -141,6 +153,7 @@ pub async fn maintain(handle: NodeHandle, outbound: Outbound, fixed: Vec<SocketA
 
     let mut events = handle.subscribe();
     let mut stale = StaleTip::new(now());
+    let mut thin = ThinBook::default();
     // 同期の最中だったか。切り替わったときに 1 度だけ記録に出す。
     let mut was_syncing = false;
 
@@ -181,6 +194,8 @@ pub async fn maintain(handle: NodeHandle, outbound: Outbound, fixed: Vec<SocketA
                         crate::log_peer!(
                             "caught up, so connecting to up to {TARGET_OUTBOUND} peers"
                         );
+                        // 追いついた直後は、足りなければすぐ引いてよい。
+                        thin.caught_up();
                     }
                     was_syncing = syncing;
                 }
@@ -191,7 +206,10 @@ pub async fn maintain(handle: NodeHandle, outbound: Outbound, fixed: Vec<SocketA
                 } else {
                     TARGET_OUTBOUND
                 };
-                if let Err(e) = top_up(&handle, &outbound, cap).await {
+                // 住所帳が薄いときにシードを足すのは、追いついてからだけである。
+                // 同期の最中は 2 本で足りている。
+                let seed_if_thin = (!syncing).then_some(&mut thin);
+                if let Err(e) = top_up(&handle, &outbound, cap, seed_if_thin).await {
                     crate::log_warn!("cannot choose a destination: {e}");
                     return;
                 }
@@ -220,7 +238,14 @@ pub async fn maintain(handle: NodeHandle, outbound: Outbound, fixed: Vec<SocketA
 /// `cap` 本に足りない分を繋ぎに行く。
 ///
 /// 超えている分は切らない。同期に入る前に繋いだ相手も、同期の役に立つ。
-async fn top_up(handle: &NodeHandle, outbound: &Outbound, cap: usize) -> Result<(), String> {
+/// `thin` が渡されていれば (追いついているとき)、足りないのに当てが
+/// 無い場合にシードを引く。
+async fn top_up(
+    handle: &NodeHandle,
+    outbound: &Outbound,
+    cap: usize,
+    thin: Option<&mut ThinBook>,
+) -> Result<(), String> {
     let busy = outbound.addrs();
     if busy.len() >= cap {
         return Ok(());
@@ -229,12 +254,29 @@ async fn top_up(handle: &NodeHandle, outbound: &Outbound, cap: usize) -> Result<
 
     let mut picked = handle.address_candidates(want, busy.clone()).await?;
     if picked.is_empty() && busy.is_empty() {
-        // 住所帳に当てが無く、1 本も繋がっていない。ここで初めてシードを
-        // 引く。**繋がっている間は引かない。**
+        // 住所帳に当てが無く、1 本も繋がっていない。シードを引く。
         if !pull_seeds(handle).await? {
             return Ok(());
         }
         picked = handle.address_candidates(want, busy).await?;
+    } else if picked.is_empty() {
+        // 繋がってはいるが足りず、当ても無い。追いついていれば、間を
+        // 空けてシードを引く。
+        if let Some(thin) = thin {
+            if thin.due(now()) {
+                if thin.first_report() {
+                    crate::log_peer!(
+                        "only {} outbound peers and no other address known, so asking the \
+                         seed (at most every {} minutes)",
+                        busy.len(),
+                        THIN_BOOK_SECS / 60
+                    );
+                }
+                if pull_seeds(handle).await? {
+                    picked = handle.address_candidates(want, busy).await?;
+                }
+            }
+        }
     }
 
     for addr in picked {
@@ -259,6 +301,38 @@ async fn pull_seeds(handle: &NodeHandle) -> Result<bool, String> {
     // 答え全体が 64 バケットに押し込まれる。**
     handle.add_addresses(addrs, None).await?;
     Ok(true)
+}
+
+/// 追いついたのに本数が足りないときの、シードの引き方の覚え。
+#[derive(Debug, Default)]
+struct ThinBook {
+    /// 最後に引いた時刻。`None` なら今すぐ引いてよい。
+    pulled_at: Option<i64>,
+    /// 記録に出したか。30 分ごとに同じ行を出さない。
+    reported: bool,
+}
+
+impl ThinBook {
+    /// 追いついた。足りなければ、すぐ引いてよい。
+    fn caught_up(&mut self) {
+        self.pulled_at = None;
+    }
+
+    /// 引く時なら真。引いたものとして覚える。
+    fn due(&mut self, now: i64) -> bool {
+        if let Some(at) = self.pulled_at {
+            if now - at < THIN_BOOK_SECS {
+                return false;
+            }
+        }
+        self.pulled_at = Some(now);
+        true
+    }
+
+    /// 初めて記録に出すときだけ真。
+    fn first_report(&mut self) -> bool {
+        !std::mem::replace(&mut self.reported, true)
+    }
 }
 
 /// 先端が止まっていないかの見張り。
@@ -405,6 +479,25 @@ mod tests {
         assert_eq!(stale.quiet_for(T0 + 90), 90);
         stale.moved(T0 + 60);
         assert_eq!(stale.quiet_for(T0 + 90), 30);
+    }
+
+    #[test]
+    fn a_thin_book_pulls_the_seed_at_once_then_every_half_hour() {
+        let mut thin = ThinBook::default();
+        assert!(thin.due(T0));
+        assert!(!thin.due(T0 + 60));
+        assert!(!thin.due(T0 + THIN_BOOK_SECS - 1));
+        assert!(thin.due(T0 + THIN_BOOK_SECS));
+        // 同期し直して追いついたら、待たずに引いてよい。
+        thin.caught_up();
+        assert!(thin.due(T0 + THIN_BOOK_SECS + 5));
+    }
+
+    #[test]
+    fn a_thin_book_is_reported_once() {
+        let mut thin = ThinBook::default();
+        assert!(thin.first_report());
+        assert!(!thin.first_report());
     }
 
     #[test]

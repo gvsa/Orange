@@ -2172,10 +2172,23 @@ set while skipping an unvalidated block.
 Resolving the hostname returns the IPs of running nodes in A / AAAA records. The
 port is that network's default (DNS cannot carry a port).
 
-**The seed MUST be queried only when the address book holds no candidates and
-there is not a single outbound connection.** Once connected, nodes tell each
-other addresses, so the seed is not needed. An existing network therefore does
-not die when the seed goes down; only nodes trying to join are affected.
+**The seed MUST be queried only in one of these cases:**
+
+- the address book holds no candidates and there is not a single outbound
+  connection
+- the tip has not moved for 30 minutes (see the keep-alive rules); at most once
+  every 30 minutes
+- the node has caught up (is not syncing), has fewer than the target of 8
+  outbound connections, and the address book holds no candidates; once right
+  after catching up, then at most once every 30 minutes (since 0.1.4)
+
+The third exists because a syncing node keeps only 2 outbound connections, so it
+can catch up with a thin address book. With nothing to dial it cannot grow to 8
+and stays at 2.
+
+Once connected, nodes tell each other addresses, so the seed is not relied on.
+An existing network therefore does not die when the seed goes down; only nodes
+trying to join are affected.
 
 The seed's answer is not trusted. DNS travels in plaintext and can be rewritten
 in transit. Addresses obtained from the seed MUST be treated the same as
