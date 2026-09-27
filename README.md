@@ -239,9 +239,12 @@ queries the DNS seed (`seed.oagcoin.org`) only when its address book is empty;
 after that, nodes tell each other about addresses. It keeps 8 outbound
 connections.
 
-A node that wants inbound connections (a seed node, for instance) has to
-announce its own address. **There is no reliable way for a node to determine
-its own external address, so state it explicitly.**
+Behind a home router, the node asks the router (UPnP, or NAT-PMP) to forward
+the port and announces the router's outside address if that worked; pass
+`--no-portmap` to stop it. A machine with a public address of its own, such as
+a VPS or a seed node, has no router to ask and has to announce its address
+itself. **There is no reliable way for a node to determine its own external
+address, so state it explicitly.**
 
 ```sh
 ./target/release/oag-node run --network testnet \

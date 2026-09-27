@@ -2299,8 +2299,31 @@ would be enough to stop your outbound connections.
    turns it into a tool for siphoning the entire address book
 3. Newly confirmed reachable addresses are relayed to connected peers with
    `addr`. Addresses learned later travel by this path
-4. Your own address is announced only when the operator states it. **There is no
-   reliable way for a node to determine its own external address**
+4. Your own address is announced only when the operator states it, or when the
+   router has opened the port and reported its outside address. **There is no
+   reliable way for a node to determine its own external address.** Anyone on
+   the same LAN can forge the router's answer; the worst that does is make the
+   node announce an address that cannot be reached, and rule 3 (addresses are
+   passed on only once someone has connected) keeps that from spreading
+
+#### Asking the router to open the port
+
+A node behind a home router cannot be connected to, so adding such nodes adds
+nobody to connect to. At startup `oag-node` asks the router over UPnP IGD, and
+over NAT-PMP (RFC 6886) if nothing answers, to forward its listening port.
+
+- If that works, it announces the outside address and port the router reported
+- If the outside address is not public (CGNAT, for instance), it announces
+  nothing and asks for the mapping to be removed
+- It asks for a lease and renews at half the lease. A device that refuses
+  leases is asked for a permanent mapping, which is removed on shutdown
+- Nothing is asked when the operator has stated an address, when not
+  listening, in light mode, on regtest, or when the machine's own address is
+  already public
+- `--no-portmap` turns it off
+
+**It is on by default.** The point is to have more nodes that can be connected
+to, and an opt-in flag is one almost nobody passes.
 
 ### 14.7 Message framing
 

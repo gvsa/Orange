@@ -7,6 +7,7 @@
 //! - [`node`] — チェーン・mempool・採掘を束ねた本体
 //! - [`service`] — 本体を専用スレッドに載せ、非同期側から使えるようにする
 //! - [`peer`] — 1 本の接続の面倒を見る
+//! - [`portmap`] — ルーターに待ち受けのポートを開けてもらう (UPnP / NAT-PMP)
 //! - [`rpc`] — JSON-RPC の手続き
 //! - [`seeds`] — 最初の繋ぎ先 (DNS シード)
 //!
@@ -25,6 +26,7 @@ pub mod light;
 pub mod log;
 pub mod node;
 pub mod peer;
+pub mod portmap;
 pub mod rpc;
 pub mod seeds;
 pub mod service;

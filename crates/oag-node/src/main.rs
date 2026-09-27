@@ -83,6 +83,15 @@ enum Command {
         /// operator states it.
         #[arg(long, value_name = "address")]
         external_addr: Vec<SocketAddr>,
+        /// Do not ask the router to open the listening port.
+        ///
+        /// By default a node behind a home router asks it, over UPnP or NAT-PMP,
+        /// to forward the P2P port, and announces the router's outside address if
+        /// that worked. Without it, other nodes cannot connect to yours. Nothing is
+        /// asked when `--external-addr` is given, when not listening, in light
+        /// mode, on regtest, or when this machine already has a public address.
+        #[arg(long)]
+        no_portmap: bool,
         /// Do not discover peers automatically from the address book or the seed.
         ///
         /// Connect only to the peers named with `--connect`.
@@ -318,6 +327,7 @@ fn run() -> Result<(), String> {
             fast,
             mining_threads,
             external_addr,
+            no_portmap,
             no_discovery,
             payout,
             blocks,
@@ -439,7 +449,9 @@ fn run() -> Result<(), String> {
                     );
                 }
 
-                if !no_listen {
+                let listening = if no_listen {
+                    None
+                } else {
                     let addr = listen.unwrap_or_else(|| {
                         SocketAddr::new(network.p2p_bind_default(), network.p2p_port())
                     });
@@ -449,7 +461,8 @@ fn run() -> Result<(), String> {
                     let bound = listener.local_addr().map_err(|e| e.to_string())?;
                     println!("listening on {bound}");
                     tokio::spawn(accept_loop(handle.clone(), listener));
-                }
+                    Some(bound)
+                };
 
                 // 捨てるのは記憶域を開いたところで済んでいる
                 // (`NodeOptions::drop_index`)。剪定の可否を見る前に
@@ -520,6 +533,24 @@ fn run() -> Result<(), String> {
                     }
                 }
 
+                // ルーターに待ち受けのポートを開けてもらう。**運用者が住所を
+                // 明示していれば頼まない。** 言われたことが優先する。軽量モード
+                // は誰にも何も配れないので、繋がれても意味が無い。
+                let portmap = match listening {
+                    Some(bound) if !no_portmap && !light && external_addr.is_empty() => {
+                        match oag_node::portmap::should_try(network, Some(bound)) {
+                            Ok(()) => Some(oag_node::portmap::start(
+                                handle.clone(),
+                                network,
+                                Some(bound),
+                                bound.port(),
+                            )),
+                            Err(_) => None,
+                        }
+                    }
+                    _ => None,
+                };
+
                 if !external_addr.is_empty() {
                     for addr in &external_addr {
                         println!("announcing {addr} as our own address");
@@ -551,6 +582,11 @@ fn run() -> Result<(), String> {
                 }
 
                 wait_for_shutdown(&handle, blocks.is_some(), exit_after).await;
+                // 開けてもらったポートを閉じてもらう。期限付きなら放っておいても
+                // 消えるが、永続でしか受けない機器がある。
+                if let Some(portmap) = portmap {
+                    portmap.stop().await;
+                }
                 // 覚えた住所を残す。次の起動でシードを引かずに済む。
                 if let Err(e) = handle.save_addresses().await {
                     eprintln!("cannot write out the address book: {e}");
