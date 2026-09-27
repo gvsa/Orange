@@ -18,6 +18,10 @@ Inspired by [chroma](https://github.com/kusogakiller/chroma).
 > [latest release](https://github.com/manh923/Orange/releases/latest).**
 > You do not need Rust to try it — see
 > [Getting the binaries](#getting-the-binaries).
+>
+> **Questions, announcements and chat are on
+> [Discord](https://discord.gg/72KWbXkn86).** Come say hi, even if you are
+> only mining.
 
 | | |
 | --- | --- |

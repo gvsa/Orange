@@ -17,6 +17,9 @@ RandomX を Proof of Work に用いる、CPU マイニング型の UTXO ブロ�
 > [最新のリリース](https://github.com/manh923/Orange/releases/latest)
 > に置いています。** Rust は要りません。詳しくは
 > [出来合いを落とす](#出来合いを落とす)。
+>
+> **質問・告知・雑談は [Discord](https://discord.gg/72KWbXkn86) で。**
+> 掘っているだけの人も、気軽にどうぞ。
 
 | 項目 | 内容 |
 | --- | --- |

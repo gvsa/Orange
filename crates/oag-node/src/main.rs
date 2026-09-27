@@ -414,6 +414,15 @@ fn run() -> Result<(), String> {
                     status.next_difficulty
                 );
 
+                // 掘る人は全員この画面を見る。質問や告知の場所を知らせる。
+                // 本物の場所を名指ししておけば、偽の招待にも引っかかりにくい。
+                if network == Network::Mainnet {
+                    println!(
+                        "questions and announcements: Discord https://discord.gg/72KWbXkn86 \
+                         and bitcointalk https://bitcointalk.org/index.php?topic=5594978.0"
+                    );
+                }
+
                 // **黙って効かせてはならない。** 検証を一部やめているので、
                 // 起動のたびに言う。
                 if let Some(keep) = prune_undo {
