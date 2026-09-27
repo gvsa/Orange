@@ -2578,7 +2578,7 @@ separate interface means loosening one does not loosen the other.
 
 - Verbs `GET` and `HEAD` only; everything else is refused
 - Paths `/`, `/block/<height|hash>`, `/tx/<txid>`, `/address/<address>`,
-  `/mempool`, `/stats`, `/search?q=`
+  `/mempool`, `/stats`, `/richlist`, `/search?q=`
 - Request headers up to 8 KB; one request per connection
 
 **Both paths and queries are strings the user chooses.** Every value embedded in
@@ -2592,11 +2592,22 @@ node without one, **display "not held" rather than an empty history.** An empty
 view is read by the user as "there are no transactions". Browsing blocks works
 without an index.
 
-#### Statistics (`/stats`)
+#### Statistics (`/stats`, `/richlist`)
 
 Days running (since block 1), the average block interval, the hashrate, the
 number of addresses holding coins, the number that have ever mined, the numbers
 that mined or received in the last 7 days, and the number of transactions.
+
+**How the coins are held is shown, not hidden:** the shares of the largest
+address, the largest 10 and the largest 100, addresses and coins per balance
+band, and the largest 100 at `/richlist`. Hiding concentration invites more
+suspicion than showing it and letting it be seen to thin out.
+
+Day by day (UTC), line charts show the hashrate, the addresses that mined, the
+addresses holding coins at the end of the day, the shares of the largest 1 and
+10, and the number of transactions; the same numbers are given as a table.
+**The page carries no JavaScript.** Lines are SVG, ticks and dates are HTML,
+and each day's column carries its values in a `<title>`.
 
 - **The hashrate is an estimate.** The expected number of hashes per block is
   the difficulty itself, so the difficulties of the last n blocks are summed and
@@ -2607,9 +2618,13 @@ that mined or received in the last 7 days, and the number of transactions.
 - The genesis block is left out of every count: its time is not when the chain
   started, and its reward is burned
 - What has been counted is remembered, and later only new blocks are added. If
-  the remembered tip has left the chain, everything is counted again. Addresses
-  holding coins come from a full scan of the UTXO set, so that is redone only
-  when the tip moves
+  the remembered tip has left the chain, everything is counted again
+- Each day's holdings are the balances at its end. The node's UTXO set only
+  knows the present, so **outputs are followed here** as they are created and
+  spent; only the payee and amount of each unspent output are kept, about the
+  size of the UTXO set itself
+- Timestamps can go backwards. A block that looks like it belongs to an earlier
+  date goes into the current day, and a closed day is never reopened
 
 #### List history oldest-first
 

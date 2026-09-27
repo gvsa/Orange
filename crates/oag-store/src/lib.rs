@@ -37,6 +37,6 @@ mod store;
 pub mod txindex;
 
 pub use store::{
-    BlockSummary, IndexStats, Store, StoreError, StoreView, TxLocation, UtxoSummary,
-    MIN_BLOCK_KEEP, SUGGESTED_BLOCK_KEEP, SUGGESTED_UNDO_KEEP,
+    BlockSummary, IndexStats, Store, StoreError, StoreView, TxLocation, MIN_BLOCK_KEEP,
+    SUGGESTED_BLOCK_KEEP, SUGGESTED_UNDO_KEEP,
 };

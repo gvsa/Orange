@@ -56,9 +56,6 @@ struct Shared {
     handle: NodeHandle,
     /// 鎖の統計。数えたところまでを覚えておき、次は足すだけにする。
     tally: Mutex<Tally>,
-    /// UTXO セットのまとめと、それを数えたときの先端。先端が動くまでは
-    /// 数え直さない。全件走査なので、頁を開くたびに走らせない。
-    utxo: Mutex<Option<(Hash, oag_store::UtxoSummary)>>,
 }
 
 /// 待ち受けを始める。実際に結びついた住所を返す。
@@ -73,7 +70,6 @@ pub async fn start_explorer(handle: NodeHandle, addr: SocketAddr) -> Result<Sock
     let shared = Arc::new(Shared {
         handle,
         tally: Mutex::new(Tally::new()),
-        utxo: Mutex::new(None),
     });
 
     // 統計を先に数えておく。最初に頁を開いた人を待たせない。
@@ -196,6 +192,7 @@ async fn route(shared: &Shared, target: &str) -> Response {
     match segments.as_slice() {
         [""] => overview(shared).await,
         ["stats"] => stats_page(shared).await,
+        ["richlist"] => richlist_page(shared).await,
         ["search"] => search(handle, query).await,
         ["block", rest @ ..] => block_page(handle, &rest.join("/"), query).await,
         ["tx", rest @ ..] => tx_page(handle, &rest.join("/")).await,
@@ -311,21 +308,8 @@ async fn stats_page(shared: &Shared) -> Response {
     if let Err(e) = stats::catch_up(&mut tally, handle).await {
         return error_page(&e);
     }
-
-    // UTXO セットは先端が動いたときだけ数え直す。
-    let utxo = {
-        let mut cached = shared.utxo.lock().await;
-        match *cached {
-            Some((tip, summary)) if tip == status.tip => summary,
-            _ => match handle.utxo_summary().await {
-                Ok(summary) => {
-                    *cached = Some((status.tip, summary));
-                    summary
-                }
-                Err(e) => return error_page(&e),
-            },
-        }
-    };
+    let holdings = tally.holdings();
+    let days = tally.days();
 
     let mut body = String::new();
     body.push_str(&search_box(""));
@@ -363,7 +347,11 @@ async fn stats_page(shared: &Shared) -> Response {
     body.push_str("</div>");
 
     body.push_str("<h2>people</h2><div class=\"grid\">");
-    stat(&mut body, "addresses holding coins", &group(utxo.holders));
+    stat(
+        &mut body,
+        "addresses holding coins",
+        &group(holdings.holders as u64),
+    );
     stat(
         &mut body,
         "addresses that have mined",
@@ -383,20 +371,156 @@ async fn stats_page(shared: &Shared) -> Response {
     stat(
         &mut body,
         "coins unspent",
-        &format!("{} OAG", esc(&atomic_to_oag(utxo.total))),
+        &format!("{} OAG", esc(&whole_oag(holdings.supply))),
     );
     body.push_str("</div>");
 
-    body.push_str("<div class=\"wrap\"><table class=\"kv\">");
-    if let Some(first) = tally.first_time() {
-        row_raw(
-            &mut body,
-            "block 1",
-            &format!("<a href=\"/block/1\">{}</a> UTC", utc(first)),
+    // 保有の分布。
+    body.push_str("<h2>who holds the coins</h2><div class=\"grid\">");
+    stat(&mut body, "largest address", &percent(holdings.top1));
+    stat(&mut body, "largest 10", &percent(holdings.top10));
+    stat(&mut body, "largest 100", &percent(holdings.top100));
+    body.push_str("</div>");
+    body.push_str(
+        "<div class=\"wrap\"><table class=\"list\"><tr class=\"head\"><th>balance</th>\
+         <th class=\"num\">addresses</th><th class=\"num\">coins</th><th class=\"num\">share</th></tr>",
+    );
+    for band in tally.bands() {
+        let range = match band.to {
+            Some(to) if band.from == 0 => format!("under {} OAG", group(to)),
+            Some(to) => format!("{} – {} OAG", group(band.from), group(to)),
+            None => format!("{} OAG and over", group(band.from)),
+        };
+        let share = if holdings.supply == 0 {
+            0.0
+        } else {
+            band.amount as f64 / holdings.supply as f64
+        };
+        let _ = write!(
+            body,
+            "<tr><td data-label=\"balance\">{range}</td>\
+             <td data-label=\"addresses\" class=\"num\">{holders}</td>\
+             <td data-label=\"coins\" class=\"num\">{coins} OAG</td>\
+             <td data-label=\"share\" class=\"num\">{share}</td></tr>",
+            range = esc(&range),
+            holders = group(band.holders as u64),
+            coins = esc(&whole_oag(band.amount)),
+            share = percent(share),
         );
     }
-    row(&mut body, "unspent outputs", &group(utxo.outputs));
     body.push_str("</table></div>");
+    body.push_str("<p><a href=\"/richlist\">the 100 largest addresses &rarr;</a></p>");
+
+    // 日ごとの推移。
+    body.push_str("<h2>day by day (UTC)</h2>");
+    if days.is_empty() {
+        body.push_str("<p class=\"note\">nothing has been mined yet.</p>");
+    } else {
+        let labels: Vec<String> = days
+            .iter()
+            .map(|d| {
+                let date = utc(d.day * 86_400)[..10].to_string();
+                if d.partial {
+                    format!("{date} (so far)")
+                } else {
+                    date
+                }
+            })
+            .collect();
+        let series = |f: &dyn Fn(&stats::Day) -> Option<f64>| -> Vec<Option<f64>> {
+            days.iter().map(f).collect()
+        };
+        body.push_str(&line_chart(
+            "hashrate",
+            &labels,
+            &[("hashrate", "s1", series(&|d| d.hashrate()))],
+            false,
+            &|v| stats::format_hashrate(v),
+        ));
+        body.push_str(&line_chart(
+            "addresses that mined",
+            &labels,
+            &[("addresses", "s1", series(&|d| Some(d.miners as f64)))],
+            true,
+            &|v| group(v.round() as u64),
+        ));
+        body.push_str(&line_chart(
+            "addresses holding coins, at the end of the day",
+            &labels,
+            &[(
+                "addresses",
+                "s1",
+                series(&|d| Some(d.holdings.holders as f64)),
+            )],
+            true,
+            &|v| group(v.round() as u64),
+        ));
+        body.push_str(&line_chart(
+            "share of all coins held by the largest addresses",
+            &labels,
+            &[
+                (
+                    "largest address",
+                    "s1",
+                    series(&|d| Some(d.holdings.top1 * 100.0)),
+                ),
+                (
+                    "largest 10",
+                    "s2",
+                    series(&|d| Some(d.holdings.top10 * 100.0)),
+                ),
+            ],
+            false,
+            &|v| format!("{v:.0}%"),
+        ));
+        body.push_str(&line_chart(
+            "transactions",
+            &labels,
+            &[(
+                "transactions",
+                "s1",
+                series(&|d| Some(d.transactions as f64)),
+            )],
+            true,
+            &|v| group(v.round() as u64),
+        ));
+
+        // 同じ数字を表でも出す。色が見分けにくい人、数字を写したい人のため。
+        body.push_str(
+            "<details><summary>the same numbers as a table</summary>\
+             <div class=\"wrap\"><table class=\"list\"><tr class=\"head\"><th>day</th>\
+             <th class=\"num\">blocks</th><th class=\"num\">hashrate</th>\
+             <th class=\"num\">mined</th><th class=\"num\">new</th>\
+             <th class=\"num\">holding</th><th class=\"num\">largest</th>\
+             <th class=\"num\">largest 10</th><th class=\"num\">txs</th></tr>",
+        );
+        for (day, label) in days.iter().zip(&labels).rev() {
+            let _ = write!(
+                body,
+                "<tr><td data-label=\"day\" class=\"mono\">{label}</td>\
+                 <td data-label=\"blocks\" class=\"num\">{blocks}</td>\
+                 <td data-label=\"hashrate\" class=\"num\">{rate}</td>\
+                 <td data-label=\"mined\" class=\"num\">{miners}</td>\
+                 <td data-label=\"new\" class=\"num\">{new}</td>\
+                 <td data-label=\"holding\" class=\"num\">{holders}</td>\
+                 <td data-label=\"largest\" class=\"num\">{top1}</td>\
+                 <td data-label=\"largest 10\" class=\"num\">{top10}</td>\
+                 <td data-label=\"txs\" class=\"num\">{txs}</td></tr>",
+                label = esc(label),
+                blocks = group(day.blocks),
+                rate = day
+                    .hashrate()
+                    .map_or_else(|| "—".to_string(), stats::format_hashrate),
+                miners = group(day.miners as u64),
+                new = group(day.new_miners as u64),
+                holders = group(day.holdings.holders as u64),
+                top1 = percent(day.holdings.top1),
+                top10 = percent(day.holdings.top10),
+                txs = group(day.transactions),
+            );
+        }
+        body.push_str("</table></div></details>");
+    }
 
     body.push_str(
         "<p class=\"note\">The hashrate is an estimate: the work the difficulty asks for, \
@@ -407,6 +531,237 @@ async fn stats_page(shared: &Shared) -> Response {
     );
 
     ok(page("statistics", &body))
+}
+
+async fn richlist_page(shared: &Shared) -> Response {
+    let handle = &shared.handle;
+    let network = handle.network();
+    let mut tally = shared.tally.lock().await;
+    if let Err(e) = stats::catch_up(&mut tally, handle).await {
+        return error_page(&e);
+    }
+    let holdings = tally.holdings();
+
+    let mut body = String::new();
+    body.push_str(&search_box(""));
+    body.push_str("<h1>the 100 largest addresses</h1>");
+    let _ = write!(
+        body,
+        "<p class=\"note\">{} addresses hold {} OAG. One person can hold many addresses.</p>",
+        group(holdings.holders as u64),
+        esc(&whole_oag(holdings.supply)),
+    );
+    body.push_str(
+        "<div class=\"wrap\"><table class=\"list\"><tr class=\"head\"><th>#</th><th>address</th>\
+         <th class=\"num\">balance</th><th class=\"num\">share</th><th class=\"num\">total so far</th></tr>",
+    );
+    let mut running = 0u128;
+    for (rank, (lock, amount)) in tally.richest(100).into_iter().enumerate() {
+        running += amount;
+        let addr = lock
+            .to_address(network)
+            .map(|a| a.to_string())
+            .unwrap_or_else(|_| format!("version {}", lock.version()));
+        let share = |n: u128| {
+            if holdings.supply == 0 {
+                0.0
+            } else {
+                n as f64 / holdings.supply as f64
+            }
+        };
+        let _ = write!(
+            body,
+            "<tr><td data-label=\"#\">{rank}</td>\
+             <td data-label=\"address\" class=\"mono trunc\"><a href=\"/address/{a}\">{short}</a></td>\
+             <td data-label=\"balance\" class=\"num\">{balance} OAG</td>\
+             <td data-label=\"share\" class=\"num\">{share}</td>\
+             <td data-label=\"total so far\" class=\"num\">{cumulative}</td></tr>",
+            rank = rank + 1,
+            a = esc(&addr),
+            short = esc(&shorten(&addr)),
+            balance = esc(&whole_oag(amount)),
+            share = percent(share(amount)),
+            cumulative = percent(share(running)),
+        );
+    }
+    body.push_str("</table></div>");
+    ok(page("richest addresses", &body))
+}
+
+/// 日ごとの折れ線。
+///
+/// **JavaScript を使わない。** 頁は読むだけのものであり、スクリプトを
+/// 持たないことで差し込みの余地を狭めている。線は SVG を横に引き伸ばして
+/// 描き (線の太さは `non-scaling-stroke` で保つ)、目盛りと日付は SVG の
+/// 外の HTML に置く。こうすれば画面の幅によらず文字の大きさが変わらない。
+/// 値は各日の列の `<title>` に持たせ、指を置けば出る。
+fn line_chart(
+    title: &str,
+    labels: &[String],
+    series: &[(&str, &str, Vec<Option<f64>>)],
+    whole: bool,
+    format: &dyn Fn(f64) -> String,
+) -> String {
+    let n = labels.len().max(1);
+    let max = series
+        .iter()
+        .flat_map(|(_, _, values)| values.iter().flatten())
+        .fold(0.0f64, |m, v| m.max(*v));
+    let (top, step) = nice_scale(max, whole);
+    let y = |v: f64| {
+        if top > 0.0 {
+            100.0 - v / top * 100.0
+        } else {
+            100.0
+        }
+    };
+
+    let mut out = String::new();
+    // 見出しに最新の値を添える。数字を全部の点に書かないかわりに、
+    // いちばん知りたい 1 つだけを出す。
+    let latest: Vec<String> = series
+        .iter()
+        .filter_map(|(name, _, values)| {
+            let v = values.last().copied().flatten()?;
+            Some(if series.len() > 1 {
+                format!("{name} {}", format(v))
+            } else {
+                format(v)
+            })
+        })
+        .collect();
+    let _ = write!(
+        out,
+        "<figure class=\"chart\"><figcaption><b>{}</b> <span class=\"note\">latest: {}</span></figcaption>",
+        esc(title),
+        esc(&latest.join(", ")),
+    );
+    if series.len() > 1 {
+        out.push_str("<div class=\"legend\">");
+        for (name, class, _) in series {
+            let _ = write!(
+                out,
+                "<span><i class=\"key {class}\"></i>{}</span>",
+                esc(name)
+            );
+        }
+        out.push_str("</div>");
+    }
+    out.push_str("<div class=\"plot\">");
+    let mut tick = 0.0;
+    while tick <= top + step / 2.0 && step > 0.0 {
+        let _ = write!(
+            out,
+            "<span class=\"y\" style=\"top:{:.2}%\">{}</span>",
+            y(tick),
+            esc(&format(tick))
+        );
+        tick += step;
+    }
+    let _ = write!(
+        out,
+        "<svg viewBox=\"0 0 {n} 100\" preserveAspectRatio=\"none\" role=\"img\" aria-label=\"{}\">",
+        esc(title)
+    );
+    let mut tick = 0.0;
+    while tick <= top + step / 2.0 && step > 0.0 {
+        let _ = write!(
+            out,
+            "<line class=\"gridline\" x1=\"0\" x2=\"{n}\" y1=\"{v:.2}\" y2=\"{v:.2}\" vector-effect=\"non-scaling-stroke\"/>",
+            v = y(tick)
+        );
+        tick += step;
+    }
+    for (_, class, values) in series {
+        let mut points = String::new();
+        for (i, v) in values.iter().enumerate() {
+            let Some(v) = v else { continue };
+            let _ = write!(points, "{:.3},{:.2} ", i as f64 + 0.5, y(*v));
+        }
+        // 1 日しか無ければ点にならないので、幅いっぱいに引く。
+        if values.len() == 1 {
+            if let Some(v) = values[0] {
+                points = format!("0,{0:.2} {n},{0:.2}", y(v));
+            }
+        }
+        let _ = write!(
+            out,
+            "<polyline class=\"line {class}\" points=\"{}\" vector-effect=\"non-scaling-stroke\"/>",
+            points.trim_end()
+        );
+    }
+    for (i, label) in labels.iter().enumerate() {
+        let values: Vec<String> = series
+            .iter()
+            .map(|(name, _, values)| {
+                let v = values
+                    .get(i)
+                    .copied()
+                    .flatten()
+                    .map_or_else(|| "—".to_string(), format);
+                if series.len() > 1 {
+                    format!("{name}: {v}")
+                } else {
+                    v
+                }
+            })
+            .collect();
+        let _ = write!(
+            out,
+            "<rect class=\"hit\" x=\"{i}\" y=\"0\" width=\"1\" height=\"100\"><title>{}: {}</title></rect>",
+            esc(label),
+            esc(&values.join(", "))
+        );
+    }
+    out.push_str("</svg></div>");
+    let first = labels.first().map(String::as_str).unwrap_or("");
+    let last = labels.last().map(String::as_str).unwrap_or("");
+    let _ = write!(
+        out,
+        "<div class=\"xaxis\"><span>{}</span><span>{}</span></div></figure>",
+        esc(first),
+        if labels.len() > 1 {
+            esc(last)
+        } else {
+            String::new()
+        },
+    );
+    out
+}
+
+/// 目盛りの上端と刻み。刻みは 1・2・5 の 10 のべき倍にし、4 目盛り前後にする。
+///
+/// `whole` なら刻みを 1 より細かくしない。人数や件数に 0.5 の目盛りを
+/// 振ると、丸めた表示が「1、1、2、2」と重なる。
+fn nice_scale(max: f64, whole: bool) -> (f64, f64) {
+    if max <= 0.0 || !max.is_finite() {
+        return (1.0, 1.0);
+    }
+    let rough = max / 4.0;
+    let power = 10f64.powf(rough.log10().floor());
+    let mut step = [1.0, 2.0, 5.0, 10.0]
+        .iter()
+        .map(|m| m * power)
+        .find(|s| *s >= rough)
+        .unwrap_or(10.0 * power);
+    if whole {
+        step = step.max(1.0);
+    }
+    ((max / step).ceil() * step, step)
+}
+
+/// 0〜1 の割合を百分率にする。
+fn percent(share: f64) -> String {
+    format!("{:.1}%", share * 100.0)
+}
+
+/// 最小単位を、小数点以下を 2 桁に丸めた OAG にする。表に 16 桁並べると
+/// 読めない。正確な値はアドレスの頁にある。
+fn whole_oag(atomic: u128) -> String {
+    let unit = oag_primitives::amount::ATOMIC_PER_OAG;
+    let cents = (atomic + unit / 200) / (unit / 100);
+    let whole = (cents / 100) as u64;
+    format!("{}.{:02}", group(whole), cents % 100)
 }
 
 async fn search(handle: &NodeHandle, query: &str) -> Response {
@@ -1042,8 +1397,8 @@ fn page(title: &str, body: &str) -> String {
 }
 
 pub(crate) const CSS: &str = "\
-:root{--bg:#fff;--fg:#1a1a1a;--dim:#666;--line:#e3e3e3;--accent:#e8720c;--card:#faf9f7;}\
-@media (prefers-color-scheme:dark){:root{--bg:#16150f;--fg:#ececec;--dim:#9a9a9a;--line:#333;--accent:#ff9f45;--card:#1f1e18;}}\
+:root{--bg:#fff;--fg:#1a1a1a;--dim:#666;--line:#e3e3e3;--accent:#e8720c;--card:#faf9f7;--s1:#d9650a;--s2:#2f6fd6;}\
+@media (prefers-color-scheme:dark){:root{--bg:#16150f;--fg:#ececec;--dim:#9a9a9a;--line:#333;--accent:#ff9f45;--card:#1f1e18;--s1:#d6711c;--s2:#5a84dc;}}\
 *{box-sizing:border-box}\
 body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.6 system-ui,-apple-system,'Hiragino Sans','Noto Sans JP',sans-serif;}\
 header{display:flex;flex-wrap:wrap;gap:12px;align-items:baseline;justify-content:space-between;\
@@ -1087,6 +1442,20 @@ font-family:system-ui,-apple-system,sans-serif;font-size:13px;line-height:24px}}
 .tag{background:var(--card);border:1px solid var(--line);border-radius:4px;padding:0 4px;font-size:11px;color:var(--dim)}\
 .nav{margin:16px 0}\
 code{background:var(--card);border:1px solid var(--line);border-radius:4px;padding:1px 5px;font-size:13px}\
+.chart{margin:16px 0 28px}.chart figcaption{margin-bottom:8px}\
+.legend{display:flex;flex-wrap:wrap;gap:4px 16px;font-size:12px;color:var(--dim);margin-bottom:6px}\
+.key{display:inline-block;width:14px;height:2px;border-radius:1px;vertical-align:middle;margin-right:6px}\
+.key.s1{background:var(--s1)}.key.s2{background:var(--s2)}\
+.plot{position:relative;height:160px;margin:8px 0 0 64px}\
+.plot svg{display:block;width:100%;height:100%;overflow:visible}\
+.plot .y{position:absolute;left:-64px;width:58px;text-align:right;transform:translateY(-50%);\
+font-size:11px;color:var(--dim);font-variant-numeric:tabular-nums;white-space:nowrap}\
+.gridline{stroke:var(--line);stroke-width:1}\
+.line{fill:none;stroke-width:2;stroke-linejoin:round;stroke-linecap:round}\
+.line.s1{stroke:var(--s1)}.line.s2{stroke:var(--s2)}\
+.hit{fill:transparent}.hit:hover{fill:var(--line);fill-opacity:.6}\
+.xaxis{display:flex;justify-content:space-between;margin-left:64px;font-size:11px;color:var(--dim)}\
+details summary{cursor:pointer;color:var(--dim);font-size:13px;margin:8px 0}\
 ";
 
 // ━━━━━━━━ 変換 ━━━━━━━━
@@ -1250,6 +1619,57 @@ mod tests {
         assert_eq!(query_value("q=abc&from=5", "from").as_deref(), Some("5"));
         assert_eq!(query_value("q=abc", "missing"), None);
         assert_eq!(query_value("", "q"), None);
+    }
+
+    #[test]
+    fn chart_scales_use_round_steps() {
+        assert_eq!(nice_scale(100.0, false), (100.0, 50.0));
+        assert_eq!(nice_scale(4_200.0, false), (6_000.0, 2_000.0));
+        assert_eq!(nice_scale(7.0, true), (8.0, 2.0));
+        assert_eq!(nice_scale(0.0, false), (1.0, 1.0));
+        assert_eq!(nice_scale(f64::NAN, false), (1.0, 1.0));
+        // 人数に半端な目盛りは振らない。
+        assert_eq!(nice_scale(2.0, false), (2.0, 0.5));
+        assert_eq!(nice_scale(2.0, true), (2.0, 1.0));
+    }
+
+    #[test]
+    fn amounts_in_tables_are_rounded_to_cents() {
+        let unit = oag_primitives::amount::ATOMIC_PER_OAG;
+        assert_eq!(whole_oag(95_179 * unit + unit / 2), "95,179.50");
+        assert_eq!(whole_oag(unit / 1000), "0.00");
+        assert_eq!(whole_oag(unit - 1), "1.00");
+        assert_eq!(percent(0.6949), "69.5%");
+    }
+
+    #[test]
+    fn a_chart_has_a_line_per_series_and_a_hover_target_per_day() {
+        let labels = vec!["a<b".to_string(), "c".to_string(), "d".to_string()];
+        let html = line_chart(
+            "t<i>tle",
+            &labels,
+            &[
+                ("one", "s1", vec![Some(1.0), None, Some(3.0)]),
+                ("two", "s2", vec![Some(2.0), Some(2.0), Some(2.0)]),
+            ],
+            false,
+            &|v| format!("{v:.0}"),
+        );
+        assert_eq!(html.matches("<polyline").count(), 2);
+        assert_eq!(html.matches("class=\"hit\"").count(), 3);
+        // 2 系列なので凡例がある。欠けた日は線から外し、表示は「—」。
+        assert!(html.contains("class=\"legend\""));
+        assert!(html.contains("one: —"));
+        // 利用者の決めた文字列ではないが、見出しも日付も逃がす。
+        assert!(!html.contains("t<i>tle") && !html.contains("a<b"));
+        let single = line_chart(
+            "x",
+            &labels[..1],
+            &[("x", "s1", vec![Some(5.0)])],
+            true,
+            &|v| format!("{v}"),
+        );
+        assert!(!single.contains("class=\"legend\""));
     }
 
     #[test]

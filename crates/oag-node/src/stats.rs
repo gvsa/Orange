@@ -1,4 +1,4 @@
-//! 鎖の統計。エクスプローラの `/stats` が出す数字を数える。
+//! 鎖の統計。エクスプローラの `/stats` と `/richlist` が出す数字を数える。
 //!
 //! # 何を数えるか
 //!
@@ -7,9 +7,8 @@
 //! - 採掘したことのあるアドレスの数、直近 7 日に採掘した数
 //! - 直近 7 日にコインを受け取ったアドレスの数
 //! - 取引の数 (採掘の報酬を除く)
-//!
-//! 残高を持つアドレスの数は UTXO セットから数えるので、ここではなく
-//! [`crate::service::NodeHandle::utxo_summary`] が受け持つ。
+//! - アドレスごとの残高 (保有の分布、上位の一覧)
+//! - 以上の日ごとの推移 (UTC の日付で区切る)
 //!
 //! # ハッシュレートの出し方
 //!
@@ -17,7 +16,15 @@
 //! 要るハッシュ数の期待値は**難易度そのもの**である。直近 n ブロックの
 //! 難易度の和を、その n ブロックにかかった時間で割れば、その間の
 //! 平均のハッシュレートになる。1 ブロックだけで割ると運に振り回される
-//! ので、幅を持たせる。
+//! ので、幅を持たせる。日ごとの値は、その日のブロックの難易度の和を
+//! その日の長さ (鎖が動いていた分) で割る。
+//!
+//! # 残高を自分で追う
+//!
+//! 日ごとの保有の推移は、その日の終わりの残高から出す。ノードの UTXO
+//! セットは今の姿しか持たないので、ここで**出力の出入りを自分で追う**。
+//! 持つのは使われていない出力の支払い先と金額だけで、大きさは UTXO
+//! セットと同じ程度である。
 //!
 //! # 数え直しを避ける
 //!
@@ -26,10 +33,12 @@
 //! 滅多に起きず、起きても数秒で済む。
 
 use crate::service::NodeHandle;
+use oag_consensus::codec::Encode;
 use oag_consensus::lock::Lock;
+use oag_consensus::tx::OutPoint;
 use oag_consensus::Block;
 use oag_primitives::Hash;
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 /// 「直近」とみなす期間 (秒)。
 pub const RECENT_SECONDS: i64 = 7 * 24 * 60 * 60;
@@ -37,6 +46,8 @@ pub const RECENT_SECONDS: i64 = 7 * 24 * 60 * 60;
 pub const SHORT_WINDOW: usize = 60;
 /// ハッシュレートの長い窓 (約 1 日)。
 pub const LONG_WINDOW: usize = 1440;
+/// 1 日の秒数。
+const DAY: i64 = 86_400;
 
 /// 1 ブロック分の覚え書き。直近の分だけ持つ。
 #[derive(Debug, Clone)]
@@ -45,6 +56,78 @@ struct Recent {
     difficulty: u64,
     miners: Vec<Lock>,
     receivers: Vec<Lock>,
+}
+
+/// 1 日分の数字。
+#[derive(Debug, Clone, PartialEq)]
+pub struct Day {
+    /// 1970-01-01 からの日数 (UTC)。
+    pub day: i64,
+    /// その日のブロックの数。
+    pub blocks: u64,
+    /// その日のブロックの難易度の和。
+    pub work: u128,
+    /// その日のうち、鎖が動いていた秒数。
+    pub seconds: i64,
+    /// その日に採掘した支払い先の数。
+    pub miners: usize,
+    /// その日に初めて採掘した支払い先の数。
+    pub new_miners: usize,
+    /// その日の取引の数 (コインベースを除く)。
+    pub transactions: u64,
+    /// その日の終わりの保有の姿。
+    pub holdings: Holdings,
+    /// まだ終わっていない日か。
+    pub partial: bool,
+}
+
+impl Day {
+    /// その日の平均のハッシュレート (H/s)。
+    pub fn hashrate(&self) -> Option<f64> {
+        (self.seconds > 0).then(|| self.work as f64 / self.seconds as f64)
+    }
+}
+
+/// ある時点の保有の姿。
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct Holdings {
+    /// 残高を持つ支払い先の数。
+    pub holders: usize,
+    /// 残高の合計 (最小単位)。
+    pub supply: u128,
+    /// 最も多く持つ 1 件の割合 (0〜1)。
+    pub top1: f64,
+    /// 上位 10 件の割合。
+    pub top10: f64,
+    /// 上位 100 件の割合。
+    pub top100: f64,
+}
+
+/// 残高帯ごとの人数と金額。
+#[derive(Debug, Clone, PartialEq)]
+pub struct Band {
+    /// 下限 (OAG、この値を含む)。
+    pub from: u64,
+    /// 上限 (OAG、この値を含まない)。`None` は上限なし。
+    pub to: Option<u64>,
+    /// 支払い先の数。
+    pub holders: usize,
+    /// 金額の合計 (最小単位)。
+    pub amount: u128,
+}
+
+/// 残高帯の区切り (OAG)。
+pub const BAND_EDGES: [u64; 5] = [1, 10, 100, 1_000, 10_000];
+
+/// 開いている (まだ終わっていない) 日。
+#[derive(Debug, Clone, Default)]
+struct OpenDay {
+    day: i64,
+    blocks: u64,
+    work: u128,
+    miners: HashSet<Lock>,
+    new_miners: usize,
+    transactions: u64,
 }
 
 /// 数えた結果。
@@ -62,6 +145,14 @@ pub struct Tally {
     transactions: u64,
     /// 直近のブロック。古い順。
     recent: VecDeque<Recent>,
+    /// 使われていない出力の支払い先と金額。
+    unspent: HashMap<OutPoint, (Lock, u128)>,
+    /// 支払い先ごとの残高。0 になったものは消す。
+    balances: HashMap<Lock, u128>,
+    /// 終わった日。
+    days: Vec<Day>,
+    /// 今の日。
+    open: Option<OpenDay>,
 }
 
 impl Tally {
@@ -73,7 +164,7 @@ impl Tally {
     /// 次のブロックを足す。**高さの順に渡すこと。**
     ///
     /// ジェネシスは数えない。ジェネシスの時刻は鎖が動き出した時刻ではなく、
-    /// 報酬は誰のものでもない (焼却されている)。
+    /// 報酬は誰のものでもない (焼却されていて、UTXO セットにも入らない)。
     pub fn add(&mut self, block: &Block, hash: Hash) {
         let height = block.header.height;
         self.tip = Some((height, hash));
@@ -86,19 +177,72 @@ impl Tally {
         }
         self.tip_time = time;
 
+        // 日が替わっていれば、前の日を閉じる。**残高はこのブロックを足す
+        // 前の姿である。** それが前の日の終わりの姿になる。時刻は前後し
+        // うるので、前の日付に見えるブロックは今の日に入れる。
+        let today = time.div_euclid(DAY);
+        match &self.open {
+            Some(open) if today > open.day => {
+                let closed = self.close_open(false);
+                self.days.push(closed);
+                self.open = Some(OpenDay {
+                    day: today,
+                    ..OpenDay::default()
+                });
+            }
+            Some(_) => {}
+            None => {
+                self.open = Some(OpenDay {
+                    day: today,
+                    ..OpenDay::default()
+                })
+            }
+        }
+
         let mut miners = Vec::new();
         let mut receivers = Vec::new();
+        let mut first_time_miners = 0;
+        let mut transactions = 0;
         for tx in &block.transactions {
-            if tx.is_coinbase() {
+            let coinbase = tx.is_coinbase();
+            if coinbase {
                 for output in &tx.outputs {
                     miners.push(output.lock.clone());
-                    self.miners.insert(output.lock.clone());
+                    if self.miners.insert(output.lock.clone()) {
+                        first_time_miners += 1;
+                    }
                 }
             } else {
-                self.transactions += 1;
+                transactions += 1;
+                for input in &tx.inputs {
+                    if let Some((lock, amount)) = self.unspent.remove(&input.prev_out) {
+                        self.debit(&lock, amount);
+                    }
+                }
+            }
+            let txid = tx.txid();
+            for (index, output) in tx.outputs.iter().enumerate() {
+                let amount = output.amount.to_atomic();
+                self.unspent.insert(
+                    OutPoint::new(txid, index as u32),
+                    (output.lock.clone(), amount),
+                );
+                if amount > 0 {
+                    *self.balances.entry(output.lock.clone()).or_insert(0) += amount;
+                }
             }
             receivers.extend(tx.outputs.iter().map(|o| o.lock.clone()));
         }
+        self.transactions += transactions;
+
+        if let Some(open) = self.open.as_mut() {
+            open.blocks += 1;
+            open.work += u128::from(block.header.difficulty);
+            open.miners.extend(miners.iter().cloned());
+            open.new_miners += first_time_miners;
+            open.transactions += transactions;
+        }
+
         self.recent.push_back(Recent {
             time,
             difficulty: block.header.difficulty,
@@ -115,6 +259,113 @@ impl Tally {
             }
             self.recent.pop_front();
         }
+    }
+
+    fn debit(&mut self, lock: &Lock, amount: u128) {
+        if let Some(balance) = self.balances.get_mut(lock) {
+            *balance = balance.saturating_sub(amount);
+            if *balance == 0 {
+                self.balances.remove(lock);
+            }
+        }
+    }
+
+    /// 開いている日を、今の残高で締めた姿にする。
+    fn close_open(&self, partial: bool) -> Day {
+        let open = self.open.clone().unwrap_or_default();
+        let start = (open.day * DAY).max(self.first_time.unwrap_or(i64::MIN));
+        let end = if partial {
+            self.tip_time
+        } else {
+            (open.day + 1) * DAY
+        };
+        Day {
+            day: open.day,
+            blocks: open.blocks,
+            work: open.work,
+            seconds: (end - start).max(0),
+            miners: open.miners.len(),
+            new_miners: open.new_miners,
+            transactions: open.transactions,
+            holdings: self.holdings(),
+            partial,
+        }
+    }
+
+    /// 日ごとの数字。古い順。最後の 1 件はまだ終わっていない今日である。
+    pub fn days(&self) -> Vec<Day> {
+        let mut days = self.days.clone();
+        if self.open.is_some() {
+            days.push(self.close_open(true));
+        }
+        days
+    }
+
+    /// 今の保有の姿。
+    pub fn holdings(&self) -> Holdings {
+        let mut amounts: Vec<u128> = self.balances.values().copied().collect();
+        amounts.sort_unstable_by(|a, b| b.cmp(a));
+        let supply: u128 = amounts.iter().sum();
+        let share = |n: usize| {
+            if supply == 0 {
+                0.0
+            } else {
+                amounts.iter().take(n).sum::<u128>() as f64 / supply as f64
+            }
+        };
+        Holdings {
+            holders: amounts.len(),
+            supply,
+            top1: share(1),
+            top10: share(10),
+            top100: share(100),
+        }
+    }
+
+    /// 残高の多い順に `n` 件。同額は支払い条件の符号化の順に並べる
+    /// (頁を開くたびに順番が入れ替わらないように)。
+    pub fn richest(&self, n: usize) -> Vec<(Lock, u128)> {
+        let mut all: Vec<(Lock, u128)> =
+            self.balances.iter().map(|(l, a)| (l.clone(), *a)).collect();
+        all.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.encode().cmp(&b.0.encode())));
+        all.truncate(n);
+        all
+    }
+
+    /// 残高帯ごとの人数と金額。
+    pub fn bands(&self) -> Vec<Band> {
+        let unit = oag_primitives::amount::ATOMIC_PER_OAG;
+        let mut bands: Vec<Band> = Vec::new();
+        let mut from = 0u64;
+        for edge in BAND_EDGES {
+            bands.push(Band {
+                from,
+                to: Some(edge),
+                holders: 0,
+                amount: 0,
+            });
+            from = edge;
+        }
+        bands.push(Band {
+            from,
+            to: None,
+            holders: 0,
+            amount: 0,
+        });
+        for amount in self.balances.values() {
+            let band = bands
+                .iter_mut()
+                .find(|b| b.to.is_none_or(|to| *amount < u128::from(to) * unit))
+                .expect("the last band has no upper bound");
+            band.holders += 1;
+            band.amount += amount;
+        }
+        bands
+    }
+
+    /// 使われていない出力の数。
+    pub fn unspent_outputs(&self) -> usize {
+        self.unspent.len()
     }
 
     /// 数え終えた先端。
@@ -339,6 +590,114 @@ mod tests {
         }
         assert_eq!(tally.recent.len(), LONG_WINDOW + 1);
         assert!(tally.hashrate(LONG_WINDOW).is_some());
+    }
+
+    /// 送金の取引。`spend` の出力を使い、`to` へ `oag` を送り、残りを
+    /// `change` へ返す。
+    fn pay(spend: OutPoint, to: u8, oag: u128, change: u8, back: u128) -> Transaction {
+        let unit = oag_primitives::amount::ATOMIC_PER_OAG;
+        Transaction {
+            version: CURRENT_TX_VERSION,
+            inputs: vec![TxInput::new(spend)],
+            outputs: vec![
+                TxOutput::new(Amount::from_atomic(oag * unit).unwrap(), lock(to)),
+                TxOutput::new(Amount::from_atomic(back * unit).unwrap(), lock(change)),
+            ],
+            locktime: 0,
+        }
+    }
+
+    #[test]
+    fn balances_follow_the_coins() {
+        let unit = oag_primitives::amount::ATOMIC_PER_OAG;
+        let mut tally = Tally::new();
+        let first = block(1, 1_000, 1, 1, &[]);
+        let reward = OutPoint::new(first.transactions[0].txid(), 0);
+        tally.add(&first, Hash::ZERO);
+        assert_eq!(tally.holdings().holders, 1);
+
+        // 2 ブロック目で、1 の報酬 (1 OAG) を 2 へ 0 OAG、1 へおつり 1 OAG と使う。
+        let mut second = block(2, 1_060, 1, 3, &[]);
+        second.transactions.push(pay(reward, 2, 0, 1, 1));
+        tally.add(&second, Hash::ZERO);
+
+        let holdings = tally.holdings();
+        // 1 (おつり 1 OAG) と 3 (報酬 1 OAG)。2 は 0 OAG なので数えない。
+        assert_eq!(holdings.holders, 2);
+        assert_eq!(holdings.supply, 2 * unit);
+        assert_eq!(holdings.top1, 0.5);
+        assert_eq!(tally.unspent_outputs(), 3);
+        assert_eq!(tally.transactions(), 1);
+    }
+
+    #[test]
+    fn the_richest_come_first_and_ties_keep_their_order() {
+        let mut tally = Tally::new();
+        tally.add(&block(1, 1_000, 1, 1, &[]), Hash::ZERO);
+        tally.add(&block(2, 1_060, 1, 2, &[]), Hash::ZERO);
+        tally.add(&block(3, 1_120, 1, 1, &[]), Hash::ZERO);
+        let top = tally.richest(10);
+        assert_eq!(top.len(), 2);
+        assert_eq!(top[0].0, lock(1));
+        assert!(top[0].1 > top[1].1);
+        assert_eq!(tally.richest(1).len(), 1);
+        // 同額の並びは何度引いても同じ。
+        let mut even = Tally::new();
+        even.add(&block(1, 1_000, 1, 5, &[]), Hash::ZERO);
+        even.add(&block(2, 1_060, 1, 6, &[]), Hash::ZERO);
+        assert_eq!(even.richest(2), even.richest(2));
+    }
+
+    #[test]
+    fn balances_fall_into_bands() {
+        let mut tally = Tally::new();
+        tally.add(&block(1, 1_000, 1, 1, &[]), Hash::ZERO);
+        let bands = tally.bands();
+        assert_eq!(bands.len(), BAND_EDGES.len() + 1);
+        // 1 OAG は「1 以上 10 未満」に入る。
+        let band = bands.iter().find(|b| b.holders == 1).unwrap();
+        assert_eq!((band.from, band.to), (1, Some(10)));
+        assert_eq!(bands.last().unwrap().to, None);
+    }
+
+    #[test]
+    fn days_are_closed_with_the_balances_at_their_end() {
+        let mut tally = Tally::new();
+        // 1 日目の昼に始まり、2 ブロック。2 日目に 1 ブロック。
+        let noon = 10 * DAY + DAY / 2;
+        tally.add(&block(1, noon, 100, 1, &[]), Hash::ZERO);
+        tally.add(&block(2, noon + 60, 100, 2, &[]), Hash::ZERO);
+        tally.add(&block(3, 11 * DAY + 30, 300, 1, &[]), Hash::ZERO);
+
+        let days = tally.days();
+        assert_eq!(days.len(), 2);
+        let first = &days[0];
+        assert_eq!(
+            (first.day, first.blocks, first.miners, first.new_miners),
+            (10, 2, 2, 2)
+        );
+        // 鎖が動き出した昼から日付が替わるまで。
+        assert_eq!(first.seconds, DAY / 2);
+        assert_eq!(first.hashrate(), Some(200.0 / (DAY / 2) as f64));
+        // 1 日目の終わりには 2 人が 1 OAG ずつ持っていた。
+        assert_eq!(first.holdings.holders, 2);
+        assert!(!first.partial);
+
+        let second = &days[1];
+        assert_eq!((second.day, second.blocks, second.new_miners), (11, 1, 0));
+        assert!(second.partial);
+        assert_eq!(second.seconds, 30);
+    }
+
+    #[test]
+    fn a_block_that_looks_like_yesterday_stays_in_today() {
+        let mut tally = Tally::new();
+        tally.add(&block(1, 10 * DAY + 10, 1, 1, &[]), Hash::ZERO);
+        // 時刻が少し前後して、前の日付に見える。
+        tally.add(&block(2, 10 * DAY - 5, 1, 1, &[]), Hash::ZERO);
+        let days = tally.days();
+        assert_eq!(days.len(), 1);
+        assert_eq!(days[0].blocks, 2);
     }
 
     #[test]

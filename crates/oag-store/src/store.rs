@@ -502,17 +502,6 @@ pub struct IndexStats {
     pub addr_entries: u64,
 }
 
-/// UTXO セットを支払い先ごとにまとめたもの。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct UtxoSummary {
-    /// 出力の数。
-    pub outputs: u64,
-    /// 支払い先 (支払い条件) の種類の数。**残高を持つアドレスの数**に当たる。
-    pub holders: u64,
-    /// 金額の合計 (最小単位)。
-    pub total: u128,
-}
-
 /// 永続化された記憶域。
 pub struct Store {
     db: Database,
@@ -978,27 +967,6 @@ impl Store {
         let txn = self.db.begin_read().map_err(db_err)?;
         let table = txn.open_table(UTXO).map_err(db_err)?;
         table.len().map_err(db_err)
-    }
-
-    /// UTXO セットを支払い先ごとにまとめる。
-    ///
-    /// 全件を走査する。大きさは [`Self::scan_utxos`] と同じく、チェーンの
-    /// 長さではなく使われていない出力の数で決まる。
-    pub fn utxo_summary(&self) -> Result<UtxoSummary, StoreError> {
-        let txn = self.db.begin_read().map_err(db_err)?;
-        let table = txn.open_table(UTXO).map_err(db_err)?;
-
-        let mut summary = UtxoSummary::default();
-        let mut holders = std::collections::HashSet::new();
-        for row in table.iter().map_err(db_err)? {
-            let (_, value) = row.map_err(db_err)?;
-            let entry = UtxoEntry::decode(value.value())?;
-            summary.outputs += 1;
-            summary.total += entry.output.amount.to_atomic();
-            holders.insert(entry.output.lock);
-        }
-        summary.holders = holders.len() as u64;
-        Ok(summary)
     }
 
     /// 支払い条件が一致する UTXO を集める。
