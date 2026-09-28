@@ -379,7 +379,7 @@ impl Node {
 
     /// 他所から来たブロックを受け取る。
     ///
-    /// ヘッダを既に知っているなら検証器を用意しない ([`HeaderAlreadyChecked`])。
+    /// ヘッダを既に知っているなら検証器を用意しない。PoW は見直されない。
     pub fn accept_block(&mut self, block: Block, now: i64) -> Result<AcceptOutcome, NodeError> {
         let outcome = if self.chain.contains(&block.header.hash())? {
             self.chain
@@ -440,7 +440,7 @@ impl Node {
 
     /// 他所から来たヘッダを受け取る。
     ///
-    /// 既に知っているヘッダなら検証器を用意しない ([`HeaderAlreadyChecked`])。
+    /// 既に知っているヘッダなら検証器を用意しない。PoW は見直されない。
     pub fn accept_header(
         &mut self,
         header: &BlockHeader,
