@@ -73,6 +73,8 @@ scenario!(headers_alone_do_not_move_the_tip);
 scenario!(a_known_header_is_not_added_twice);
 scenario!(bodies_arriving_out_of_order_wait_for_their_parents);
 scenario!(missing_bodies_are_listed_oldest_first);
+scenario!(a_gap_below_held_bodies_is_still_listed);
+scenario!(a_gap_in_a_heavier_branch_is_listed_from_a_side_tip);
 scenario!(headers_are_served_from_the_fork_point);
 scenario!(a_header_for_an_invalid_block_is_refused);
 

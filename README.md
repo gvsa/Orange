@@ -149,6 +149,11 @@ The node mines only when you pass `--mine`, which requires a `--payout` address
 for the reward. Adding `--fast` uses RandomX fast mode (2 GB); without it,
 mining stays in light mode (256 MB).
 
+While the node is still catching up with the chain, it waits and starts mining
+once it has caught up (`[mining] caught up, so starting to mine`). A block found
+on an old tip would be thrown away anyway, and the mining threads would slow the
+sync down.
+
 ```sh
 ./target/release/oag-node run --network mainnet --datadir ./oag-data \
     --mine --fast --payout <address> --blocks 5

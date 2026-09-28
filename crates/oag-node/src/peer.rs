@@ -242,6 +242,7 @@ async fn session(
         rejected_txs: 0,
         last_body_at: started,
         stall_reported: false,
+        behind_since: None,
         // nonce は見分けがつけばよい。推測されて困るものではない。
         liveness: Liveness::new(started, handle.nonce() ^ peer.rotate_left(32)),
         last_tip_at: started,
@@ -357,6 +358,8 @@ struct Session {
     last_body_at: i64,
     /// 止まっていることを既に報せたか。**1 回だけ出す。**
     stall_reported: bool,
+    /// 相手より遅れ始めた時刻。追いついていれば `None`。
+    behind_since: Option<i64>,
     /// 相手が生きているかの見張り。
     liveness: Liveness,
     /// 最後に先端が動いた時刻。誰がくれたか、自分で掘ったかは問わない。
@@ -535,20 +538,33 @@ impl Session {
     ///
     /// 進み具合の行は**ブロックが繋がったときにしか出ない**。止まると
     /// 記録も止まり、外からは「同期し終わった」のと区別がつかなくなる。
+    ///
+    /// # 比べるのは繋いだ先端である
+    ///
+    /// 以前は知っているヘッダの高さと比べていた。ヘッダが相手に追いつくと、
+    /// **本体が 1 つも来なくても黙る。** 0.1.7 の Windows のノードは、
+    /// ヘッダだけ 15,133 まで知ったまま、先端 14,403 で何も言わずに止まった。
+    ///
+    /// 遅れ始めた時刻も数える。先端の近くでは、相手が新しいブロックを
+    /// 知らせてから本体が届くまでの一瞬だけ遅れる。前の本体からの時間で
+    /// 測ると、ブロック間隔の 60 秒をそのまま「止まっている」と取り違える。
     async fn report_stall(&mut self, handle: &NodeHandle) -> Result<(), String> {
-        let ours = handle.best_header_height().await?;
-        if self.peer_height <= ours {
+        let tip = handle.tip_height().await?;
+        if self.peer_height <= tip {
             // 遅れていない。待っているのは当たり前である。
             self.stall_reported = false;
+            self.behind_since = None;
             return Ok(());
         }
-        let waited = now() - self.last_body_at;
+        let now = now();
+        let behind_since = *self.behind_since.get_or_insert(now);
+        let waited = now - behind_since.max(self.last_body_at);
         if waited < STALL_SECS || self.stall_reported {
             return Ok(());
         }
         self.stall_reported = true;
         crate::log_sync!(
-            "no block body for {waited} seconds (peer {}, us {ours})",
+            "no block body for {waited} seconds (peer at {}, connected up to {tip})",
             self.peer_height
         );
         Ok(())

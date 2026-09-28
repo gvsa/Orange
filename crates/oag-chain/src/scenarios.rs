@@ -671,6 +671,105 @@ pub fn missing_bodies_are_listed_oldest_first<S: ChainStore>(store: S) {
     assert!(chain.missing_bodies(0).unwrap().is_empty());
 }
 
+/// 本体を持つブロックの下に穴があっても、その穴が挙がること。
+///
+/// 本体は順不同に届くので、上のほうだけ届いて途中が欠けることは普通に
+/// ある。取り寄せ中の一覧はメモリにしか無いので、その状態で再起動すると
+/// 穴を覚えているのはインデックスだけになる。**先端側から遡って本体に
+/// 当たったところで探すのをやめると、穴は二度と取り寄せられない。**
+pub fn a_gap_below_held_bodies_is_still_listed<S: ChainStore>(store: S) {
+    let mut chain = open(store);
+    let genesis = chain.tip().unwrap().hash;
+
+    let mut parent = genesis;
+    let mut blocks = Vec::new();
+    for i in 0..6 {
+        let block = build_on(&chain, parent, 400 + i);
+        parent = block.header.hash();
+        chain
+            .accept_header(&block.header, &AcceptAnyPow, NOW)
+            .unwrap();
+        blocks.push(block);
+    }
+    let gap = blocks[1].header.hash();
+
+    // 高さ 1 は繋がる。高さ 2 を飛ばして 3〜6 を渡す。
+    let mut rest = blocks.split_off(1);
+    let second = rest.remove(0);
+    chain
+        .accept_block(blocks.pop().unwrap(), &AcceptAnyPow, NOW)
+        .unwrap();
+    for block in rest {
+        chain.accept_block(block, &AcceptAnyPow, NOW).unwrap();
+    }
+    assert_eq!(chain.height().unwrap(), 1);
+
+    assert_eq!(
+        chain.missing_bodies(100).unwrap(),
+        vec![gap],
+        "the gap under the held bodies must be fetched"
+    );
+
+    // 穴が埋まれば一気に繋がり、欲しいものは無くなる。
+    chain.accept_block(second, &AcceptAnyPow, NOW).unwrap();
+    assert_eq!(chain.height().unwrap(), 6);
+    assert!(chain.missing_bodies(100).unwrap().is_empty());
+}
+
+/// 自分の枝の上にいても、重い枝の穴が挙がること。
+///
+/// 0.1.0 / 0.1.1 はシードの境界で正しいブロックに無効の印を付け、自分
+/// だけの枝を伸ばしたまま止まった。印の後に届いた本体は捨てていたので、
+/// 印を外した後の重い枝は**本体が虫食いになっている。** 穴を拾えないと、
+/// 軽い自分の枝に留まったまま何も言わずに止まる。
+pub fn a_gap_in_a_heavier_branch_is_listed_from_a_side_tip<S: ChainStore>(store: S) {
+    let mut chain = open(store);
+    let genesis = chain.tip().unwrap().hash;
+
+    // 自分の枝。高さ 2 まで繋いである。
+    let ours = extend(&mut chain, genesis, 2, 7);
+    assert_eq!(chain.tip().unwrap().hash, ours[1]);
+
+    // 重い枝。ヘッダはすべて知っていて、本体は高さ 2 だけが無い。
+    let mut parent = genesis;
+    let mut theirs = Vec::new();
+    for i in 0..5 {
+        let block = build_on(&chain, parent, 500 + i);
+        parent = block.header.hash();
+        chain
+            .accept_header(&block.header, &AcceptAnyPow, NOW)
+            .unwrap();
+        theirs.push(block);
+    }
+    let gap = theirs[1].clone();
+    for (i, block) in theirs.iter().enumerate() {
+        if i != 1 {
+            chain
+                .accept_block(block.clone(), &AcceptAnyPow, NOW)
+                .unwrap();
+        }
+    }
+    assert_eq!(
+        chain.tip().unwrap().hash,
+        ours[1],
+        "stuck on our own branch"
+    );
+
+    assert_eq!(
+        chain.missing_bodies(100).unwrap(),
+        vec![gap.header.hash()],
+        "the gap in the heavier branch must be fetched"
+    );
+
+    let outcome = chain.accept_block(gap, &AcceptAnyPow, NOW).unwrap();
+    assert!(
+        matches!(outcome, AcceptOutcome::Reorganized(ref r) if r.disconnected.len() == 2),
+        "our two blocks are dropped: {outcome:?}"
+    );
+    assert_eq!(chain.height().unwrap(), 5);
+    assert!(chain.missing_bodies(100).unwrap().is_empty());
+}
+
 /// `getheaders` にロケータの分岐点から答えること。
 pub fn headers_are_served_from_the_fork_point<S: ChainStore>(store: S) {
     let mut chain = open(store);

@@ -210,6 +210,8 @@ enum Request {
     Status(oneshot::Sender<Result<NodeStatus, String>>),
     /// 自分の状態を名乗るための、先端の高さ。
     BestHeaderHeight(oneshot::Sender<Result<u64, String>>),
+    /// 繋いだ先端の高さ。
+    TipHeight(oneshot::Sender<Result<u64, String>>),
     /// 初期同期の最中か ([`NodeHandle::is_syncing`])。
     Syncing(oneshot::Sender<Result<bool, String>>),
     /// ブロックロケータ。
@@ -521,6 +523,11 @@ impl NodeHandle {
     /// 最良ヘッダの高さ。
     pub async fn best_header_height(&self) -> Result<u64, String> {
         self.ask(Request::BestHeaderHeight).await
+    }
+
+    /// 繋いだ先端の高さ。知っているだけのヘッダは含まない。
+    pub async fn tip_height(&self) -> Result<u64, String> {
+        self.ask(Request::TipHeight).await
     }
 
     /// 同期の最中か。知っているヘッダより、繋いだ本体が
@@ -865,6 +872,8 @@ struct Service {
     mining_since: Option<Instant>,
     /// 掘った数がここに達したら止める。
     mine_until: Option<u64>,
+    /// 同期の最中なので採掘を待たせているか。記録を 1 度だけ出すため。
+    mining_held: bool,
     /// 採掘スレッドの束。掘っていなければ `None`。
     pool: Option<MiningPool>,
     /// いまの束を建てたときのシードエポックと掘り方。
@@ -992,6 +1001,7 @@ impl NodeService {
                     rate_samples: VecDeque::new(),
                     mining_since: None,
                     mine_until: None,
+                    mining_held: false,
                     pool: None,
                     pool_built_for: None,
                     mode: MiningMode::light(),
@@ -1095,10 +1105,12 @@ impl Service {
                 }
             }
 
-            if self.mining.is_some() {
+            if self.mining.is_some() && !self.hold_mining_for_sync() {
                 self.mine();
             } else {
                 // 掘らないなら、採掘スレッドを畳んで次の要求まで眠る。
+                // 同期で待たせているときも同じである。追いついたかどうかは
+                // ブロックが届いたとき (= 要求を捌いたとき) にしか変わらない。
                 self.retire_pool();
                 match rx.blocking_recv() {
                     Some(Request::Shutdown) | None => {
@@ -1109,6 +1121,33 @@ impl Service {
                 }
             }
         }
+    }
+
+    /// 同期の最中なら採掘を待たせる。待たせるなら真。
+    ///
+    /// # なぜ待つのか
+    ///
+    /// 追いつく前に掘ったブロックは**古い先端の上に載る。** 当たっても、
+    /// 追いついた時点で捨てられるだけである。そのうえ fast モードの
+    /// データセット作りはこのスレッドを 1 分止め、採掘スレッドは全コアを
+    /// 使う。ブロックの検証と取り込みがその分遅れ、追いつくのが遅くなる。
+    /// **掘っても無駄なうえに、同期の足を引っ張る。**
+    ///
+    /// 追いつけばデータセットを作って掘り始める。
+    fn hold_mining_for_sync(&mut self) -> bool {
+        // 分からないなら止めない。これまでどおり掘る。
+        let syncing = self.syncing().unwrap_or_default();
+        if syncing != self.mining_held {
+            if syncing {
+                crate::log_mine!(
+                    "waiting to catch up before mining (a block found now would sit on an old tip)"
+                );
+            } else {
+                crate::log_mine!("caught up, so starting to mine");
+            }
+            self.mining_held = syncing;
+        }
+        syncing
     }
 
     /// 採掘スレッドを回す。
@@ -1399,6 +1438,15 @@ impl Service {
                     .map_err(|e| e.to_string());
                 let _ = reply.send(result);
             }
+            Request::TipHeight(reply) => {
+                let result = self
+                    .node
+                    .chain()
+                    .tip()
+                    .map(|e| e.height())
+                    .map_err(|e| e.to_string());
+                let _ = reply.send(result);
+            }
             Request::Syncing(reply) => {
                 let _ = reply.send(self.syncing());
             }
@@ -1453,6 +1501,9 @@ impl Service {
                 self.mine_until = blocks.map(|n| self.mined.saturating_add(n));
                 self.mining = payout;
                 self.mode = mode;
+                // 待たせていた記録も初めからにする。止めて掛け直したときに
+                // 「追いついた」と出さないため。
+                self.mining_held = false;
                 // 数え直す。始まりの時刻は採掘器が建ってから入れる
                 // ([`Service::ensure_pool`])。
                 self.attempts_base = 0;
