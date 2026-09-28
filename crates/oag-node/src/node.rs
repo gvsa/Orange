@@ -18,6 +18,7 @@ use crate::addrbook::AddressBook;
 use oag_chain::chain::{AcceptOutcome, Chain, ChainError, HeaderOutcome, Reorg, Retarget};
 use oag_consensus::lock::Lock;
 use oag_consensus::params;
+use oag_consensus::validate::PowVerifier;
 use oag_consensus::{Block, BlockHeader};
 use oag_mempool::Mempool;
 use oag_miner::{build_template, BlockTemplate, TemplateError, TemplateRequest};
@@ -377,12 +378,19 @@ impl Node {
     }
 
     /// 他所から来たブロックを受け取る。
+    ///
+    /// ヘッダを既に知っているなら検証器を用意しない ([`HeaderAlreadyChecked`])。
     pub fn accept_block(&mut self, block: Block, now: i64) -> Result<AcceptOutcome, NodeError> {
-        let height = block.header.height;
-        let branch = block.header.prev_hash;
-        let outcome = self.with_verifier(height, &branch, |node, verifier| {
-            Ok(node.chain.accept_block(block.clone(), verifier, now)?)
-        })?;
+        let outcome = if self.chain.contains(&block.header.hash())? {
+            self.chain
+                .accept_block(block.clone(), &HeaderAlreadyChecked, now)?
+        } else {
+            let height = block.header.height;
+            let branch = block.header.prev_hash;
+            self.with_verifier(height, &branch, |node, verifier| {
+                Ok(node.chain.accept_block(block.clone(), verifier, now)?)
+            })?
+        };
         self.sync_mempool(&outcome, &block)?;
         Ok(outcome)
     }
@@ -431,11 +439,18 @@ impl Node {
     }
 
     /// 他所から来たヘッダを受け取る。
+    ///
+    /// 既に知っているヘッダなら検証器を用意しない ([`HeaderAlreadyChecked`])。
     pub fn accept_header(
         &mut self,
         header: &BlockHeader,
         now: i64,
     ) -> Result<HeaderOutcome, NodeError> {
+        if self.chain.contains(&header.hash())? {
+            return Ok(self
+                .chain
+                .accept_header(header, &HeaderAlreadyChecked, now)?);
+        }
         let height = header.height;
         let branch = header.prev_hash;
         self.with_verifier(height, &branch, |node, verifier| {
@@ -541,6 +556,27 @@ impl Node {
     /// ブロックをファイルに書き出す。
     pub fn export_blocks(&self, dir: &Path) -> Result<usize, NodeError> {
         Ok(self.chain.store().export_blocks(dir)?)
+    }
+}
+
+/// 既に知っているヘッダのブロックを渡すときの PoW 検証器。
+///
+/// チェーンは、知っているヘッダの PoW を見直さない。受け取った時点で
+/// 検証済みだからである。それでも検証器を用意すると、RandomX の
+/// キャッシュ (256 MB) をそのヘッダのエポックに合わせて作り直すことになる。
+///
+/// 初期同期では、シードの境目より下の本体を取り寄せている間に、境目より
+/// 上の新しいヘッダがピアから流れてくる。以前は両者が届くたびに二つの
+/// エポックを行き来し、1 回あたり数秒かかる作り直しを延々と繰り返して
+/// 同期が大きく遅れた。
+///
+/// **呼ばれたら通さない。** 呼ばれないはずだが、万一呼ばれても検証を
+/// 素通りさせることはない。
+struct HeaderAlreadyChecked;
+
+impl PowVerifier for HeaderAlreadyChecked {
+    fn verify(&self, _header: &BlockHeader) -> bool {
+        false
     }
 }
 
@@ -654,6 +690,53 @@ mod tests {
         let orphaned = orphaned_transactions(&reorg, |h| Ok(blocks.get(h).cloned())).unwrap();
 
         assert_eq!(orphaned, vec![payment]);
+    }
+
+    /// 使い捨ての記憶域でノードを開く。
+    fn open_regtest(tag: &str) -> (std::path::PathBuf, Node) {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir =
+            std::env::temp_dir().join(format!("oag-node-{tag}-{}-{nanos}", std::process::id()));
+        let node = Node::open(Network::Regtest, &dir).unwrap();
+        (dir, node)
+    }
+
+    #[test]
+    fn a_known_header_does_not_build_a_verifier() {
+        // 知っているヘッダの PoW は見直さない。検証器を用意すれば、
+        // RandomX のキャッシュを作り直すだけ無駄になる。
+        let (dir, mut node) = open_regtest("known-header");
+        let genesis = crate::genesis::genesis_for(Network::Regtest);
+
+        let outcome = node.accept_header(&genesis.header, 0).unwrap();
+
+        assert_eq!(outcome, HeaderOutcome::Known);
+        assert!(
+            node.verifier.is_none(),
+            "built a verifier for a known header"
+        );
+        drop(node);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_body_of_a_known_header_does_not_build_a_verifier() {
+        // ヘッダ先行の同期で届く本体は、ヘッダが検証済みである。
+        let (dir, mut node) = open_regtest("known-body");
+        let genesis = crate::genesis::genesis_for(Network::Regtest);
+
+        let outcome = node.accept_block(genesis, 0).unwrap();
+
+        assert!(matches!(outcome, AcceptOutcome::Duplicate));
+        assert!(
+            node.verifier.is_none(),
+            "built a verifier for a known block"
+        );
+        drop(node);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
