@@ -28,16 +28,17 @@
 //! 読む (`oag_pow::target`)。**合意ルールは変えず**、採掘器の側で
 //! この 2 点を合わせてもらう。アルゴリズム名 [`ALGO`] がその目印である。
 
+use crate::pool::{self, Pool};
 use crate::service::{MiningJob, NodeEvent, NodeHandle};
 use oag_consensus::lock::Lock;
 use oag_consensus::{Block, BlockHeader, Encode, Transaction};
-use oag_primitives::{Address, Network};
+use oag_primitives::{Address, Amount, Network};
 use serde_json::{json, Value};
 use std::collections::{HashSet, VecDeque};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::tcp::OwnedWriteHalf;
 use tokio::net::{TcpListener, TcpStream};
@@ -119,8 +120,25 @@ pub fn nonce_of(session: u32, low: u32) -> u64 {
     (u64::from(session) << 32) | u64::from(low)
 }
 
-/// Stratum の待ち受けを始める。実際に待ち受けた住所を返す。
+/// シェアの難易度を見直すまでに待つシェアの数。
+const RETARGET_SHARES: u32 = 6;
+
+/// シェアが少なくても、これだけ経てば難易度を見直す。
+const RETARGET_AFTER: Duration = Duration::from_secs(120);
+
+/// ソロの Stratum を始める。実際に待ち受けた住所を返す。
+///
+/// 見つけたブロックの報酬は、採掘器がログインしたアドレスに直接入る。
 pub async fn start_stratum(handle: NodeHandle, addr: SocketAddr) -> Result<SocketAddr, String> {
+    start_stratum_with(handle, addr, None).await
+}
+
+/// Stratum を始める。`pool` を渡すとプールとして動く ([`crate::pool`])。
+pub async fn start_stratum_with(
+    handle: NodeHandle,
+    addr: SocketAddr,
+    pool: Option<Arc<Pool>>,
+) -> Result<SocketAddr, String> {
     let listener = TcpListener::bind(addr)
         .await
         .map_err(|e| format!("cannot listen for stratum on {addr}: {e}"))?;
@@ -130,6 +148,7 @@ pub async fn start_stratum(handle: NodeHandle, addr: SocketAddr) -> Result<Socke
 
     let shared = Arc::new(Shared {
         handle,
+        pool,
         next_session: AtomicU32::new(1),
         open: AtomicUsize::new(0),
     });
@@ -160,6 +179,8 @@ pub async fn start_stratum(handle: NodeHandle, addr: SocketAddr) -> Result<Socke
 
 struct Shared {
     handle: NodeHandle,
+    /// プールとして動くなら、その台帳。`None` ならソロ。
+    pool: Option<Arc<Pool>>,
     /// 次の接続に渡すナンスの上位 32 ビット。
     next_session: AtomicU32,
     /// いま開いている接続の数。
@@ -171,13 +192,25 @@ struct Job {
     id: u64,
     header: BlockHeader,
     transactions: Vec<Transaction>,
+    /// この仕事で配ったシェアの難易度。ソロならブロックの難易度と同じ。
+    share_difficulty: u64,
 }
 
 /// ログインを済ませた接続。
 struct Session {
     /// ナンスの上位 32 ビット。
     id: u32,
+    /// ログインしたアドレス。ソロでは報酬の受取先、プールでは支払い先。
     payout: Lock,
+    /// ログインしたアドレスの文字列 (プールの台帳の鍵)。
+    payee: String,
+    /// プールで配るシェアの難易度。0 はまだ決めていない。
+    share_difficulty: u64,
+    /// 難易度を見直してからのシェアの数と、その起点。
+    shares_since: u32,
+    since: Instant,
+    /// 難易度を変えたので、すぐに仕事を配り直す。
+    retargeted: bool,
     /// 記録に出す名前。
     worker: String,
     jobs: VecDeque<Job>,
@@ -240,6 +273,15 @@ async fn serve(shared: &Shared, stream: TcpStream, peer: SocketAddr) {
                 let reply = handle_line(shared, &mut session, &line, peer).await;
                 if send(&mut write, &reply).await.is_err() {
                     break;
+                }
+                // シェアの難易度が変わった。古い目安のまま掘らせ続けない。
+                if session.as_ref().is_some_and(|s| s.retargeted) {
+                    if let Some(s) = session.as_mut() {
+                        s.retargeted = false;
+                    }
+                    if push_job(shared, &mut session, &mut write).await.is_err() {
+                        break;
+                    }
                 }
                 if session.as_ref().is_some_and(|s| s.invalid >= MAX_INVALID) {
                     crate::log_warn!("stratum: closing {peer} after {MAX_INVALID} invalid shares");
@@ -375,6 +417,11 @@ async fn login(
     let mut fresh = Session {
         id: shared.next_session.fetch_add(1, Ordering::SeqCst),
         payout: Lock::from_address(&address),
+        payee: address.encode(),
+        share_difficulty: 0,
+        shares_since: 0,
+        since: Instant::now(),
+        retargeted: false,
         worker,
         jobs: VecDeque::new(),
         next_job: 0,
@@ -409,19 +456,39 @@ async fn make_job(shared: &Shared, session: &mut Session) -> Result<Value, Strin
     if shared.handle.is_syncing().await? {
         return Err("the node is still catching up with the chain; try again shortly".to_string());
     }
+    // プールなら報酬はプールの鍵へ。ソロなら採掘器のアドレスへ直接。
+    let payout = match &shared.pool {
+        Some(pool) => pool.lock().clone(),
+        None => session.payout.clone(),
+    };
     let MiningJob { template, seed, .. } = shared
         .handle
-        .mining_job(session.payout.clone(), u64::from(session.id))
+        .mining_job(payout, u64::from(session.id))
         .await?;
     let mut header = template.header;
     header.nonce = nonce_of(session.id, 0);
+
+    let share_difficulty = if shared.pool.is_some() {
+        if session.share_difficulty == 0 {
+            session.share_difficulty = pool::initial_share_difficulty(header.difficulty);
+            session.since = Instant::now();
+        } else if session.since.elapsed() >= RETARGET_AFTER {
+            // 長いあいだ当たらない。易しくする。
+            retarget(session, header.difficulty);
+        }
+        // この仕事に今の難易度を載せたので、配り直しの印は要らない。
+        session.retargeted = false;
+        session.share_difficulty.min(header.difficulty).max(1)
+    } else {
+        header.difficulty
+    };
 
     session.next_job += 1;
     let id = session.next_job;
     let job = json!({
         "job_id": format!("{id:x}"),
         "blob": hex::encode(header.encode()),
-        "target": hex::encode(share_target(header.difficulty).to_le_bytes()),
+        "target": hex::encode(share_target(share_difficulty).to_le_bytes()),
         "algo": ALGO,
         "height": header.height,
         "seed_hash": hex::encode(seed.as_bytes()),
@@ -431,6 +498,7 @@ async fn make_job(shared: &Shared, session: &mut Session) -> Result<Value, Strin
         id,
         header,
         transactions: template.transactions,
+        share_difficulty,
     });
     while session.jobs.len() > KEPT_JOBS {
         session.jobs.pop_front();
@@ -452,10 +520,11 @@ async fn submit(shared: &Shared, session: &mut Session, params: &Value) -> Resul
         decode_fixed(text("result")).ok_or_else(|| "result must be 64 hex digits".to_string())?;
     let low = u32::from_le_bytes(nonce);
 
-    let (mut header, transactions) = match session.jobs.iter().find(|j| j.id == job_id) {
-        Some(job) => (job.header, job.transactions.clone()),
-        None => return Err("unknown job; it has been replaced by a newer one".to_string()),
-    };
+    let (mut header, transactions, share_difficulty) =
+        match session.jobs.iter().find(|j| j.id == job_id) {
+            Some(job) => (job.header, job.transactions.clone(), job.share_difficulty),
+            None => return Err("unknown job; it has been replaced by a newer one".to_string()),
+        };
     if !session.seen.insert((job_id, low)) {
         return Err("duplicate share".to_string());
     }
@@ -474,21 +543,49 @@ async fn submit(shared: &Shared, session: &mut Session, params: &Value) -> Resul
             header.encode().len()
         ));
     }
-    if !oag_pow::meets_difficulty(&hash, header.difficulty).unwrap_or(false) {
+    if !oag_pow::meets_difficulty(&hash, share_difficulty).unwrap_or(false) {
         session.invalid += 1;
-        return Err(
-            "low difficulty share: the hash does not meet the block target \
+        return Err("low difficulty share: the hash does not meet the target \
              (compare the first 8 bytes of the hash, read big-endian, with the target)"
-                .to_string(),
-        );
+            .to_string());
     }
 
+    if let Some(pool) = &shared.pool {
+        pool.record_share(&session.payee, share_difficulty).await;
+        session.shares_since += 1;
+        if session.shares_since >= RETARGET_SHARES || session.since.elapsed() >= RETARGET_AFTER {
+            retarget(session, header.difficulty);
+        }
+    }
+
+    // ブロックの当たりでなければ、ここまで (プールのシェア)。
+    if !oag_pow::meets_difficulty(&hash, header.difficulty).unwrap_or(false) {
+        return Ok(json!({"status": "OK"}));
+    }
+
+    let reward = Amount::sum(
+        transactions
+            .first()
+            .into_iter()
+            .flat_map(|cb| cb.outputs.iter().map(|o| o.amount)),
+    )
+    .unwrap_or(Amount::ZERO);
     let block = Block {
         header,
         transactions,
     };
     let accepted = shared.handle.accept_block(block).await?;
     if !accepted.moved_tip {
+        // プールではシェアとしては数えてある。ブロックが間に合わなかった
+        // だけで、掘った事実は変わらない。
+        if shared.pool.is_some() {
+            crate::log_mine!(
+                "stale  height {}  (stratum, {}): another block came first",
+                header.height,
+                session.worker
+            );
+            return Ok(json!({"status": "OK"}));
+        }
         return Err("stale: another block extended the chain first".to_string());
     }
     crate::log_mine!(
@@ -497,7 +594,27 @@ async fn submit(shared: &Shared, session: &mut Session, params: &Value) -> Resul
         header.hash(),
         session.worker
     );
+    if let Some(pool) = &shared.pool {
+        pool.block_found(header.hash(), header.height, reward, header.difficulty)
+            .await?;
+    }
     Ok(json!({"status": "OK"}))
+}
+
+/// シェアの難易度を見直す。変わったら、すぐ仕事を配り直す印を付ける。
+fn retarget(session: &mut Session, block_difficulty: u64) {
+    let next = pool::next_share_difficulty(
+        session.share_difficulty,
+        session.shares_since,
+        session.since.elapsed(),
+        block_difficulty,
+    );
+    if next != session.share_difficulty {
+        session.share_difficulty = next;
+        session.retargeted = true;
+    }
+    session.shares_since = 0;
+    session.since = Instant::now();
 }
 
 /// 記録に出すアドレスの略記。`oag1qz56xr…fserdd` の形。

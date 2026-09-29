@@ -113,6 +113,24 @@ oag-node run --network mainnet --stratum
 
 `--mine` と一緒に使ってもよい。内蔵の採掘と外の採掘器が並んで掘る。
 
+#### プールとして動かす
+
+```sh
+oag-node run --network mainnet --stratum 0.0.0.0:1919 --pool
+```
+
+| | すること |
+| --- | --- |
+| `--pool` | プールとして動く。`--stratum` が要る |
+| `--pool-fee <percent>` | 運営の取り分。既定 0 |
+| `--pool-fee-address <address>` | 取り分の受取先。取り分を取るなら必須 |
+| `--pool-min-payout <OAG>` | これだけたまったら払う。既定 1 OAG |
+
+報酬はいったんノードが作る鍵 (`pool.key`) で受け取り、直近のシェアの量で
+分け (PPLNS)、成熟してからまとめて払う。**払うまでの間は採掘者の取り分を
+預かっている**ので、`pool.key` と `pool.json` は必ず控えること。
+詳しくは [STRATUM.md](STRATUM.md) の §8。
+
 #### 大きなページ (large pages)
 
 `--fast` のデータセットは、OS が許せば大きなページに置く。2 GB の中を

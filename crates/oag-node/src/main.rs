@@ -10,7 +10,7 @@ use oag_net::transport::Listener;
 use oag_node::node::{self, AssumeValidSetting, Node, NodeOptions};
 use oag_node::service::{MiningMode, NodeEvent, NodeHandle, NodeService};
 use oag_node::{accept_loop, keep_dialling};
-use oag_primitives::{Address, Hash, Network, SecretKey};
+use oag_primitives::{Address, Amount, Hash, Network, SecretKey};
 use oag_store::Store;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -166,6 +166,32 @@ enum Command {
         /// whatever address it logs in with.
         #[arg(long, value_name = "address", num_args = 0..=1, conflicts_with = "light")]
         stratum: Option<Option<SocketAddr>>,
+        /// Run the stratum port as a pool rather than solo.
+        ///
+        /// Blocks pay a key this node creates (`pool.key` in the data folder),
+        /// miners are given easier shares so their work can be counted, and each
+        /// block's reward is split among the recent shares (PPLNS, twice the block
+        /// difficulty) and sent once it matures.
+        ///
+        /// **Until then the miners' rewards sit under that key.** Back up
+        /// `pool.key` and `pool.json`; losing them means they cannot be paid.
+        #[arg(long, requires = "stratum")]
+        pool: bool,
+        /// The pool operator's cut, in percent. Default 0.
+        #[arg(long, value_name = "percent", requires = "pool")]
+        pool_fee: Option<String>,
+        /// Where the operator's cut is paid, the same way miners are paid.
+        ///
+        /// Required with a non-zero `--pool-fee`: `pool.key` is a bare key that
+        /// oag-wallet cannot open, so a cut left under it could not be spent.
+        #[arg(long, value_name = "address", requires = "pool")]
+        pool_fee_address: Option<String>,
+        /// Pay a miner once this much has built up. Default 1 OAG.
+        ///
+        /// The transaction fee is taken out of the payments, in proportion to
+        /// their size.
+        #[arg(long, value_name = "OAG", requires = "pool")]
+        pool_min_payout: Option<String>,
         /// Throw away rollback data older than this many blocks. Off by default.
         ///
         /// Rollback data is only ever read when the chain reorganises back over a
@@ -357,6 +383,10 @@ fn run() -> Result<(), String> {
             tls_cert,
             tls_key,
             stratum,
+            pool,
+            pool_fee,
+            pool_fee_address,
+            pool_min_payout,
             prune_undo,
             prune,
             light,
@@ -374,6 +404,39 @@ fn run() -> Result<(), String> {
                 (true, None) => return Err("--mine requires --payout".to_string()),
                 (false, _) => None,
             };
+
+            // プールの設定も、記憶域を開く前に解釈する。
+            let mut pool_config = oag_node::pool::PoolConfig::default();
+            if let Some(text) = &pool_fee {
+                pool_config.fee_basis_points = parse_percent(text).ok_or_else(|| {
+                    format!("--pool-fee {text} is not a percentage from 0 to 100")
+                })?;
+            }
+            if let Some(text) = &pool_fee_address {
+                pool_config.fee_address = Some(
+                    Address::decode_on(network, text)
+                        .map_err(|e| format!("--pool-fee-address is invalid: {e}"))?,
+                );
+            }
+            if pool_config.fee_basis_points > 0 && pool_config.fee_address.is_none() {
+                return Err(
+                    "--pool-fee needs --pool-fee-address: pool.key is a bare key that \
+                     oag-wallet cannot open, so a cut left under it could not be spent"
+                        .to_string(),
+                );
+            }
+            if let Some(text) = &pool_min_payout {
+                pool_config.min_payout = text
+                    .parse::<Amount>()
+                    .ok()
+                    .filter(|a| *a >= oag_consensus::params::DUST_THRESHOLD)
+                    .ok_or_else(|| {
+                        format!(
+                            "--pool-min-payout {text} must be an amount of at least {}",
+                            oag_consensus::params::DUST_THRESHOLD
+                        )
+                    })?;
+            }
 
             // 記憶域を開く前に解釈する。開いてから断るのは無駄である。
             let assume_valid = match assumevalid.as_deref() {
@@ -559,9 +622,30 @@ fn run() -> Result<(), String> {
 
                 if let Some(addr) = stratum {
                     let addr = addr.unwrap_or_else(|| oag_node::stratum::default_addr(network));
-                    let bound = oag_node::stratum::start_stratum(handle.clone(), addr).await?;
+                    let pool = if pool {
+                        let pool = oag_node::pool::Pool::open(
+                            handle.clone(),
+                            &common.datadir,
+                            pool_config.clone(),
+                        )?;
+                        println!(
+                            "pool: rewards go to {} until they are paid out \
+                             (fee {}%, paying from {} OAG)",
+                            pool.address(),
+                            f64::from(pool.config().fee_basis_points) / 100.0,
+                            pool.config().min_payout
+                        );
+                        pool.clone().spawn();
+                        Some(pool)
+                    } else {
+                        None
+                    };
+                    let mode = if pool.is_some() { "pool" } else { "solo" };
+                    let bound =
+                        oag_node::stratum::start_stratum_with(handle.clone(), addr, pool).await?;
                     println!(
-                        "stratum open at {bound} for miners that speak {} (see docs/STRATUM.md)",
+                        "stratum ({mode}) open at {bound} for miners that speak {} \
+                         (see docs/STRATUM.md)",
                         oag_node::stratum::ALGO
                     );
                     if !bound.ip().is_loopback() {
@@ -838,4 +922,19 @@ fn print_status_lines(s: &node::NodeStatus) {
     }
     println!("  mempool         {}", s.mempool_len);
     println!("  peers known      {}", s.known_addresses);
+}
+
+/// `1`、`0.5`、`12.25` のような百分率を万分率にする。小数は 2 桁まで。
+fn parse_percent(text: &str) -> Option<u32> {
+    let (whole, frac) = match text.trim().split_once('.') {
+        Some((w, f)) => (w, f),
+        None => (text.trim(), ""),
+    };
+    if whole.is_empty() || frac.len() > 2 || !frac.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let whole: u32 = whole.parse().ok()?;
+    let frac: u32 = format!("{frac:0<2}").parse().ok()?;
+    let bp = whole.checked_mul(100)?.checked_add(frac)?;
+    (bp <= 10_000).then_some(bp)
 }
