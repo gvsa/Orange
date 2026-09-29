@@ -130,7 +130,7 @@ async fn serve_connection(mut stream: TcpStream, shared: Arc<Shared>) -> std::io
 }
 
 /// 要求行から要求先を取り出す。`GET` 以外は `None`。
-async fn read_target(stream: &mut TcpStream, buffer: &mut Vec<u8>) -> Option<String> {
+pub(crate) async fn read_target(stream: &mut TcpStream, buffer: &mut Vec<u8>) -> Option<String> {
     let mut chunk = [0u8; 1024];
     loop {
         if buffer.windows(4).any(|w| w == b"\r\n\r\n") {
@@ -1542,7 +1542,7 @@ details summary{cursor:pointer;color:var(--dim);font-size:13px;margin:8px 0}\
 ///
 /// **経路もクエリも利用者が決める文字列である。** そのまま埋めると、
 /// 局所の頁とはいえ任意の script を仕込める。すべての埋め込みはここを通す。
-fn esc(s: &str) -> String {
+pub(crate) fn esc(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
         match c {
@@ -1558,7 +1558,7 @@ fn esc(s: &str) -> String {
 }
 
 /// 長い識別子を頭と尻だけにする。
-fn shorten(s: &str) -> String {
+pub(crate) fn shorten(s: &str) -> String {
     if s.chars().count() <= 20 {
         return s.to_string();
     }
@@ -1569,7 +1569,7 @@ fn shorten(s: &str) -> String {
 }
 
 /// 3 桁ごとに区切る。
-fn group(n: u64) -> String {
+pub(crate) fn group(n: u64) -> String {
     let text = n.to_string();
     let mut out = String::with_capacity(text.len() + text.len() / 3);
     for (i, c) in text.chars().enumerate() {
@@ -1582,7 +1582,7 @@ fn group(n: u64) -> String {
 }
 
 /// 最小単位を OAG の表記にする。
-fn atomic_to_oag(atomic: u128) -> String {
+pub(crate) fn atomic_to_oag(atomic: u128) -> String {
     match Amount::from_atomic(atomic) {
         Ok(amount) => amount.to_string(),
         Err(_) => atomic.to_string(),
@@ -1593,7 +1593,7 @@ fn atomic_to_oag(atomic: u128) -> String {
 ///
 /// 暦の変換は Howard Hinnant の `civil_from_days` による。外部の暦を
 /// 引き込むほどの用途ではない。
-fn utc(timestamp: i64) -> String {
+pub(crate) fn utc(timestamp: i64) -> String {
     let days = timestamp.div_euclid(86_400);
     let secs = timestamp.rem_euclid(86_400);
     let (year, month, day) = civil_from_days(days);

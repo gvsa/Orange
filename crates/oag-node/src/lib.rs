@@ -28,6 +28,7 @@ pub mod log;
 pub mod node;
 pub mod peer;
 pub mod pool;
+pub mod pool_page;
 pub mod portmap;
 pub mod rpc;
 pub mod seeds;

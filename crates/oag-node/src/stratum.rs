@@ -211,6 +211,8 @@ struct Session {
     since: Instant,
     /// 難易度を変えたので、すぐに仕事を配り直す。
     retargeted: bool,
+    /// プールの状況の頁に出すための番号。ソロでは `None`。
+    worker_id: Option<u64>,
     /// 記録に出す名前。
     worker: String,
     jobs: VecDeque<Job>,
@@ -312,6 +314,9 @@ async fn serve(shared: &Shared, stream: TcpStream, peer: SocketAddr) {
     reader.abort();
     if let Some(session) = session {
         crate::log_mine!("stratum: {} disconnected", session.worker);
+        if let (Some(pool), Some(id)) = (&shared.pool, session.worker_id) {
+            pool.worker_disconnected(id).await;
+        }
     }
 }
 
@@ -422,6 +427,7 @@ async fn login(
         shares_since: 0,
         since: Instant::now(),
         retargeted: false,
+        worker_id: None,
         worker,
         jobs: VecDeque::new(),
         next_job: 0,
@@ -440,12 +446,20 @@ async fn login(
         short_address(&address.encode())
     );
 
+    if let Some(pool) = &shared.pool {
+        fresh.worker_id = Some(pool.worker_connected(&fresh.worker, &fresh.payee).await);
+    }
+
     let result = json!({
         "id": format!("{:08x}", fresh.id),
         "job": job,
         "extensions": ["algo", "keepalive"],
         "status": "OK",
     });
+    // つなぎ直し (同じ接続での二度目のログイン) なら、前の採掘器を外す。
+    if let (Some(pool), Some(old)) = (&shared.pool, session.as_ref().and_then(|s| s.worker_id)) {
+        pool.worker_disconnected(old).await;
+    }
     *session = Some(fresh);
     Ok(result)
 }
@@ -551,7 +565,12 @@ async fn submit(shared: &Shared, session: &mut Session, params: &Value) -> Resul
     }
 
     if let Some(pool) = &shared.pool {
-        pool.record_share(&session.payee, share_difficulty).await;
+        pool.record_share(
+            session.worker_id.unwrap_or(0),
+            &session.payee,
+            share_difficulty,
+        )
+        .await;
         session.shares_since += 1;
         if session.shares_since >= RETARGET_SHARES || session.since.elapsed() >= RETARGET_AFTER {
             retarget(session, header.difficulty);
@@ -595,8 +614,14 @@ async fn submit(shared: &Shared, session: &mut Session, params: &Value) -> Resul
         session.worker
     );
     if let Some(pool) = &shared.pool {
-        pool.block_found(header.hash(), header.height, reward, header.difficulty)
-            .await?;
+        pool.block_found(
+            header.hash(),
+            header.height,
+            reward,
+            header.difficulty,
+            &session.payee,
+        )
+        .await?;
     }
     Ok(json!({"status": "OK"}))
 }

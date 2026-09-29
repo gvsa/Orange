@@ -125,6 +125,11 @@ oag-node run --network mainnet --stratum 0.0.0.0:1919 --pool
 | `--pool-fee <percent>` | 運営の取り分。既定 0 |
 | `--pool-fee-address <address>` | 取り分の受取先。取り分を取るなら必須 |
 | `--pool-min-payout <OAG>` | これだけたまったら払う。既定 1 OAG |
+| `--pool-page <addr>` | 状況の頁。既定は `--stratum` と同じ住所のポート 8000 |
+
+状況の頁 (`http://<住所>:8000/`) には、つながっている採掘器、アドレスごとの
+ハッシュレートと残高、見つけたブロック、支払いが出る。`/api/stats` は同じ
+中身の JSON である。
 
 報酬はいったんノードが作る鍵 (`pool.key`) で受け取り、直近のシェアの量で
 分け (PPLNS)、成熟してからまとめて払う。**払うまでの間は採掘者の取り分を

@@ -57,6 +57,12 @@ const KEPT_PAYOUTS: usize = 200;
 /// シェアの間隔の目安 (秒)。難易度はこれに合わせて上下する。
 pub const SHARE_TARGET_SECS: u64 = 15;
 
+/// ハッシュレートを見積もる窓。この間に届いたシェアの難易度を足して割る。
+pub const HASHRATE_WINDOW: Duration = Duration::from_secs(10 * 60);
+
+/// 台帳に残す、見つけたブロックの記録の数。
+const KEPT_FOUND: usize = 100;
+
 /// プールの設定。
 #[derive(Debug, Clone)]
 pub struct PoolConfig {
@@ -106,6 +112,26 @@ pub struct Ledger {
     pub fee_earned: String,
     /// 支払いの記録。新しいものが後ろ。
     pub payouts: Vec<Payout>,
+    /// 見つけたブロックの記録。新しいものが後ろ。
+    #[serde(default)]
+    pub found: Vec<Found>,
+}
+
+/// 見つけたブロック 1 つの記録 (状況の頁に出す)。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Found {
+    /// 高さ。
+    pub height: u64,
+    /// ブロックハッシュ。
+    pub hash: String,
+    /// 見つけた時刻 (Unix 秒)。
+    pub time: i64,
+    /// 見つけた採掘者のアドレス。
+    pub finder: String,
+    /// 報酬の総額 (atomic)。
+    pub reward: String,
+    /// `immature` (成熟待ち)、`matured` (残高に移した)、`orphaned` (チェーンから外れた)。
+    pub status: String,
 }
 
 /// 見つけたブロック 1 つぶんの分け前。
@@ -154,10 +180,98 @@ pub struct Pool {
 
 struct State {
     ledger: Ledger,
+    /// 直近 [`HASHRATE_WINDOW`] のシェア (時刻, アドレス, 難易度, 採掘器)。
+    recent: VecDeque<(Instant, String, u64, u64)>,
+    /// つながっている採掘器。
+    workers: BTreeMap<u64, Worker>,
+    next_worker: u64,
+    started: Instant,
     /// 直近のシェア (アドレス, 難易度)。古いものが前。
     window: VecDeque<(String, u64)>,
     window_weight: u128,
     last_payout: Option<Instant>,
+}
+
+/// つながっている採掘器 1 台。
+#[derive(Debug, Clone)]
+struct Worker {
+    name: String,
+    payee: String,
+    since: Instant,
+    shares: u64,
+    last_share: Option<Instant>,
+}
+
+/// 状況の頁に出すもの ([`Pool::snapshot`])。
+#[derive(Debug, Clone, Serialize)]
+pub struct PoolView {
+    /// プールの受取先。
+    pub pool_address: String,
+    /// 運営の取り分 (%)。
+    pub fee_percent: f64,
+    /// 最低支払額 (OAG)。
+    pub min_payout: String,
+    /// プール全体のハッシュレート (H/s)。直近のシェアから見積もる。
+    pub hashrate: f64,
+    /// 起動してからの秒数。
+    pub uptime_secs: u64,
+    /// つながっている採掘器。
+    pub workers: Vec<WorkerView>,
+    /// アドレスごとの集計。
+    pub miners: Vec<MinerView>,
+    /// 見つけたブロック。新しい順。
+    pub found: Vec<Found>,
+    /// 支払い。新しい順。
+    pub payouts: Vec<PayoutView>,
+    /// 運営の取り分の合計 (OAG)。
+    pub fee_earned: String,
+}
+
+/// 採掘器 1 台の様子。
+#[derive(Debug, Clone, Serialize)]
+pub struct WorkerView {
+    /// 採掘器の名前。**採掘器が名乗ったもの**なので、出すときは逃がすこと。
+    pub name: String,
+    /// ログインしたアドレス。
+    pub address: String,
+    /// ハッシュレート (H/s)。
+    pub hashrate: f64,
+    /// つないでから受け付けたシェアの数。
+    pub shares: u64,
+    /// 最後のシェアから何秒経ったか。
+    pub last_share_secs: Option<u64>,
+    /// つないでから何秒経ったか。
+    pub connected_secs: u64,
+}
+
+/// アドレス 1 つの集計。
+#[derive(Debug, Clone, Serialize)]
+pub struct MinerView {
+    /// アドレス。
+    pub address: String,
+    /// ハッシュレート (H/s)。
+    pub hashrate: f64,
+    /// 成熟待ちの分け前 (OAG)。
+    pub immature: String,
+    /// 成熟して、次の支払いを待っている額 (OAG)。
+    pub balance: String,
+    /// これまでに払った額 (OAG)。
+    pub paid: String,
+}
+
+/// 支払い 1 本の様子。
+#[derive(Debug, Clone, Serialize)]
+pub struct PayoutView {
+    /// 取引 ID。
+    pub txid: String,
+    /// 出した時点の高さ。
+    pub height: u64,
+    /// 宛先の数。
+    pub recipients: usize,
+    /// 払った額 (送金手数料を引く前、OAG)。
+    pub total: String,
+    /// 承認されたか。
+    pub confirmed: bool,
 }
 
 /// 報酬を分けた結果。
@@ -219,6 +333,10 @@ impl Pool {
             path,
             state: Mutex::new(State {
                 ledger,
+                recent: VecDeque::new(),
+                workers: BTreeMap::new(),
+                next_worker: 1,
+                started: Instant::now(),
                 window: VecDeque::new(),
                 window_weight: 0,
                 last_payout: None,
@@ -247,11 +365,144 @@ impl Pool {
         self.state.lock().await.ledger.clone()
     }
 
+    /// 採掘器がつないできた。状況の頁に出すための番号を返す。
+    pub async fn worker_connected(&self, name: &str, payee: &str) -> u64 {
+        let mut state = self.state.lock().await;
+        let id = state.next_worker;
+        state.next_worker += 1;
+        state.workers.insert(
+            id,
+            Worker {
+                name: name.to_string(),
+                payee: payee.to_string(),
+                since: Instant::now(),
+                shares: 0,
+                last_share: None,
+            },
+        );
+        id
+    }
+
+    /// 採掘器が切れた。
+    pub async fn worker_disconnected(&self, id: u64) {
+        self.state.lock().await.workers.remove(&id);
+    }
+
     /// 受け付けたシェアを窓に積む。
-    pub async fn record_share(&self, payee: &str, difficulty: u64) {
+    pub async fn record_share(&self, worker: u64, payee: &str, difficulty: u64) {
         let mut state = self.state.lock().await;
         state.window.push_back((payee.to_string(), difficulty));
         state.window_weight += u128::from(difficulty);
+        let now = Instant::now();
+        state
+            .recent
+            .push_back((now, payee.to_string(), difficulty, worker));
+        while state
+            .recent
+            .front()
+            .is_some_and(|(at, ..)| now.duration_since(*at) > HASHRATE_WINDOW)
+        {
+            state.recent.pop_front();
+        }
+        if let Some(w) = state.workers.get_mut(&worker) {
+            w.shares += 1;
+            w.last_share = Some(now);
+        }
+    }
+
+    /// 状況の頁に出すものをまとめる。
+    pub async fn snapshot(&self) -> PoolView {
+        let state = self.state.lock().await;
+        let now = Instant::now();
+        // 起動して間もないときは、経った時間で割る。窓の長さで割ると低く出る。
+        let span = now
+            .duration_since(state.started)
+            .min(HASHRATE_WINDOW)
+            .as_secs_f64()
+            .max(1.0);
+        let recent = state
+            .recent
+            .iter()
+            .filter(|(at, ..)| now.duration_since(*at) <= HASHRATE_WINDOW);
+
+        let mut by_address: BTreeMap<String, f64> = BTreeMap::new();
+        let mut by_worker: BTreeMap<u64, f64> = BTreeMap::new();
+        let mut total = 0.0;
+        for (_, payee, difficulty, worker) in recent {
+            let rate = *difficulty as f64 / span;
+            *by_address.entry(payee.clone()).or_default() += rate;
+            *by_worker.entry(*worker).or_default() += rate;
+            total += rate;
+        }
+
+        let workers = state
+            .workers
+            .iter()
+            .map(|(id, w)| WorkerView {
+                name: w.name.clone(),
+                address: w.payee.clone(),
+                hashrate: by_worker.get(id).copied().unwrap_or(0.0),
+                shares: w.shares,
+                last_share_secs: w.last_share.map(|t| now.duration_since(t).as_secs()),
+                connected_secs: now.duration_since(w.since).as_secs(),
+            })
+            .collect();
+
+        // アドレスの一覧: いま掘っている人と、残高・成熟待ち・支払いのある人。
+        let mut immature: BTreeMap<String, u128> = BTreeMap::new();
+        for round in &state.ledger.rounds {
+            for (address, amount) in &round.credits {
+                *immature.entry(address.clone()).or_default() +=
+                    amount.parse::<u128>().unwrap_or(0);
+            }
+        }
+        let mut addresses: Vec<String> = by_address.keys().cloned().collect();
+        addresses.extend(immature.keys().cloned());
+        addresses.extend(state.ledger.balances.keys().cloned());
+        addresses.extend(state.ledger.paid.keys().cloned());
+        addresses.sort();
+        addresses.dedup();
+        let amount = |map: &BTreeMap<String, String>, key: &str| {
+            map.get(key)
+                .and_then(|v| v.parse::<u128>().ok())
+                .unwrap_or(0)
+        };
+        let mut miners: Vec<MinerView> = addresses
+            .into_iter()
+            .map(|address| MinerView {
+                hashrate: by_address.get(&address).copied().unwrap_or(0.0),
+                immature: oag_text(immature.get(&address).copied().unwrap_or(0)),
+                balance: oag_text(amount(&state.ledger.balances, &address)),
+                paid: oag_text(amount(&state.ledger.paid, &address)),
+                address,
+            })
+            .collect();
+        miners.sort_by(|a, b| b.hashrate.total_cmp(&a.hashrate));
+
+        PoolView {
+            pool_address: self.address.encode(),
+            fee_percent: f64::from(self.config.fee_basis_points) / 100.0,
+            min_payout: self.config.min_payout.to_string(),
+            hashrate: total,
+            uptime_secs: now.duration_since(state.started).as_secs(),
+            workers,
+            miners,
+            found: state.ledger.found.iter().rev().cloned().collect(),
+            payouts: state
+                .ledger
+                .payouts
+                .iter()
+                .rev()
+                .map(|p| PayoutView {
+                    txid: p.txid.clone(),
+                    height: p.height,
+                    recipients: p.owed.len(),
+                    total: oag_text(p.owed.values().filter_map(|v| v.parse::<u128>().ok()).sum()),
+                    confirmed: p.confirmed,
+                })
+                .collect(),
+            fee_earned: oag_text(state.ledger.fee_earned.parse().unwrap_or(0)),
+        }
     }
 
     /// ブロックを見つけた。窓のシェアで報酬を分け、成熟を待つ列に入れる。
@@ -261,6 +512,7 @@ impl Pool {
         height: u64,
         reward: Amount,
         block_difficulty: u64,
+        finder: &str,
     ) -> Result<(), String> {
         let mut state = self.state.lock().await;
         let span = u128::from(block_difficulty.max(1)) * u128::from(PPLNS_FACTOR);
@@ -283,6 +535,18 @@ impl Pool {
         }
 
         let miners = split.credits.len();
+        state.ledger.found.push(Found {
+            height,
+            hash: hash.to_string(),
+            time: unix_now(),
+            finder: finder.to_string(),
+            reward: reward.to_atomic().to_string(),
+            status: "immature".to_string(),
+        });
+        if state.ledger.found.len() > KEPT_FOUND {
+            let excess = state.ledger.found.len() - KEPT_FOUND;
+            state.ledger.found.drain(..excess);
+        }
         state.ledger.rounds.push(Round {
             hash: hash.to_string(),
             height,
@@ -351,7 +615,11 @@ impl Pool {
                 continue;
             }
             let on_chain = self.handle.hash_at_height(round.height).await?;
-            if on_chain.map(|h| h.to_string()) != Some(round.hash.clone()) {
+            let matured = on_chain.map(|h| h.to_string()) == Some(round.hash.clone());
+            if let Some(found) = state.ledger.found.iter_mut().find(|f| f.hash == round.hash) {
+                found.status = if matured { "matured" } else { "orphaned" }.to_string();
+            }
+            if !matured {
                 crate::log_warn!(
                     "pool: block {} ({}) left the chain, so its reward is gone",
                     round.height,
@@ -815,6 +1083,17 @@ fn sub(map: &mut BTreeMap<String, String>, key: &str, amount: u128) {
         .and_then(|v| v.parse::<u128>().ok())
         .unwrap_or(0);
     map.insert(key.to_string(), now.saturating_sub(amount).to_string());
+}
+
+fn oag_text(atomic: u128) -> String {
+    Amount::from_atomic(atomic).map_or_else(|_| atomic.to_string(), |a| a.to_string())
+}
+
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 fn atomic_text(atomic: u128) -> String {

@@ -16,7 +16,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, Lines};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::TcpStream;
 
@@ -145,6 +145,18 @@ async fn wait_for_height(handle: &NodeHandle, height: u64) {
     }
 }
 
+/// 状況の頁を 1 回読む。本文だけを返す。
+async fn get(addr: SocketAddr, path: &str) -> String {
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    let request = format!("GET {path} HTTP/1.1\r\nHost: pool\r\nConnection: close\r\n\r\n");
+    stream.write_all(request.as_bytes()).await.unwrap();
+    let mut response = String::new();
+    stream.read_to_string(&mut response).await.unwrap();
+    let (head, body) = response.split_once("\r\n\r\n").unwrap();
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    body.to_string()
+}
+
 fn oag(text: &str) -> u128 {
     text.parse::<Amount>().unwrap().to_atomic()
 }
@@ -166,6 +178,15 @@ async fn rewards_are_split_by_shares_and_paid_once_mature() {
         handle.clone(),
         "127.0.0.1:0".parse().unwrap(),
         Some(pool.clone()),
+    )
+    .await
+    .unwrap();
+
+    let page = oag_node::pool_page::start_pool_page(
+        pool.clone(),
+        handle.clone(),
+        "127.0.0.1:0".parse().unwrap(),
+        addr.port(),
     )
     .await
     .unwrap();
@@ -244,6 +265,17 @@ async fn rewards_are_split_by_shares_and_paid_once_mature() {
         got_b < paid_b && got_b > paid_b - oag("0.01"),
         "B got {got_b}"
     );
+
+    // 状況の頁に、つながっている 2 台、見つけた 2 つ、支払い 1 本が出る。
+    let stats: Value = serde_json::from_str(&get(page, "/api/stats").await).unwrap();
+    assert_eq!(stats["pool"]["workers"].as_array().unwrap().len(), 2);
+    assert_eq!(stats["pool"]["found"].as_array().unwrap().len(), 2);
+    assert_eq!(stats["pool"]["found"][0]["status"], "matured");
+    assert_eq!(stats["pool"]["payouts"].as_array().unwrap().len(), 1);
+    assert_eq!(stats["network"]["height"], 127);
+    let html = get(page, "/").await;
+    assert!(html.contains(&a.encode()) && html.contains(&b.encode()));
+    assert!(html.contains(&payout.txid));
 
     // 1 つ掘れば承認される。
     let other = Lock::from_address(&address());

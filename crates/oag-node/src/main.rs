@@ -192,6 +192,13 @@ enum Command {
         /// their size.
         #[arg(long, value_name = "OAG", requires = "pool")]
         pool_min_payout: Option<String>,
+        /// Where to serve the pool's status page (miners, hashrate, blocks,
+        /// payouts). Read-only.
+        ///
+        /// Defaults to port 8000 on the same address as `--stratum`, so a pool
+        /// open to the network shows its page to the network too.
+        #[arg(long, value_name = "address", requires = "pool")]
+        pool_page: Option<SocketAddr>,
         /// Throw away rollback data older than this many blocks. Off by default.
         ///
         /// Rollback data is only ever read when the chain reorganises back over a
@@ -387,6 +394,7 @@ fn run() -> Result<(), String> {
             pool_fee,
             pool_fee_address,
             pool_min_payout,
+            pool_page,
             prune_undo,
             prune,
             light,
@@ -642,12 +650,26 @@ fn run() -> Result<(), String> {
                     };
                     let mode = if pool.is_some() { "pool" } else { "solo" };
                     let bound =
-                        oag_node::stratum::start_stratum_with(handle.clone(), addr, pool).await?;
+                        oag_node::stratum::start_stratum_with(handle.clone(), addr, pool.clone())
+                            .await?;
                     println!(
                         "stratum ({mode}) open at {bound} for miners that speak {} \
                          (see docs/STRATUM.md)",
                         oag_node::stratum::ALGO
                     );
+                    if let Some(pool) = pool {
+                        let page = pool_page.unwrap_or_else(|| {
+                            SocketAddr::new(bound.ip(), oag_node::pool_page::DEFAULT_PORT)
+                        });
+                        let shown = oag_node::pool_page::start_pool_page(
+                            pool,
+                            handle.clone(),
+                            page,
+                            bound.port(),
+                        )
+                        .await?;
+                        println!("pool page open at http://{shown}/");
+                    }
                     if !bound.ip().is_loopback() {
                         oag_node::log_warn!(
                             "stratum is reachable from other machines: anyone who can reach \
