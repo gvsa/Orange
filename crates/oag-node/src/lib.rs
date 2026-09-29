@@ -32,6 +32,7 @@ pub mod rpc;
 pub mod seeds;
 pub mod service;
 pub mod stats;
+pub mod stratum;
 pub mod wallet;
 
 use oag_net::magic::magic_for;

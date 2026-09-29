@@ -159,6 +159,11 @@ fast モードでは **2 GB のデータセットを全スレッドで 1 本共�
 [docs/COMMANDS.md](docs/COMMANDS.md) の「大きなページ (large pages)」に
 あります。設定しなくても、普通のページで掘れます。
 
+外の採掘器からも掘れます。`--stratum` を付けると `127.0.0.1:1919` で仕事を
+配ります。ナンスの位置がヘッダの中で違うので、素の XMRig では掘れません。
+`rx/oag` に対応したものが要ります。やり取りの中身は
+[docs/STRATUM.md](docs/STRATUM.md) にあります。
+
 ```sh
 cargo build --release -p oag-node
 

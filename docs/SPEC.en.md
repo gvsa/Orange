@@ -1744,9 +1744,9 @@ The following therefore MUST be implemented from v1.
 
 | Network | P2P | RPC | Mining |
 | --- | ---: | ---: | ---: |
-| mainnet | 9444 | 9445 | 9446 |
-| testnet | 19444 | 19445 | 19446 |
-| regtest | 29444 | 29445 | 29446 |
+| mainnet | 9444 | 9445 | 1919 |
+| testnet | 19444 | 19445 | 11919 |
+| regtest | 29444 | 29445 | 21919 |
 
 Naming rule: `testnet = mainnet + 10000`, `regtest = mainnet + 20000`.
 
@@ -1795,6 +1795,8 @@ prevent it.
 
 The mining interface is separated from RPC specifically to avoid the situation
 where RPC has to be exposed in order to let miners connect.
+What the mining interface speaks (Stratum) is described in [STRATUM.md](STRATUM.md).
+It is an arrangement outside the consensus rules, so this document does not cover it.
 
 ### 14.2 Magic bytes
 
@@ -3665,9 +3667,9 @@ Large / irreversible handover  20 blocks or more
 Zero confirmations          MUST NOT be accepted
 
 ━━━ Network ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-mainnet P2P/RPC/Mining      9444 / 9445 / 9446
-testnet P2P/RPC/Mining      19444 / 19445 / 19446
-regtest P2P/RPC/Mining      29444 / 29445 / 29446
+mainnet P2P/RPC/Mining      9444 / 9445 / 1919
+testnet P2P/RPC/Mining      19444 / 19445 / 11919
+regtest P2P/RPC/Mining      29444 / 29445 / 21919
 RPC/Mining bind default     127.0.0.1 only
 Address book new table      1,024 buckets × 64
 Address book tried table    256 buckets × 64

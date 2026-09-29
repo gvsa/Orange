@@ -190,6 +190,11 @@ needs a one-time setting on your machine; see "大きなページ (large pages)"
 [docs/COMMANDS.md](docs/COMMANDS.md). Without it, mining still works on normal
 pages.
 
+External miners can mine through the node too: `--stratum` hands out jobs on
+`127.0.0.1:1919`. Stock XMRig cannot mine OAG, because the nonce sits at a
+different place in the header; it needs a build that speaks `rx/oag`. The
+protocol is in [docs/STRATUM.md](docs/STRATUM.md).
+
 ```sh
 cargo build --release -p oag-node
 

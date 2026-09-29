@@ -65,12 +65,19 @@ impl Network {
         self.p2p_port() + 1
     }
 
-    /// マイニング用インタフェースのポート。
+    /// マイニング用インタフェース (Stratum) のポート。
     ///
     /// RPC と分離されている。マイナーの接続を許可するために RPC を
     /// 外部公開せざるを得ない状況を構造的に避けるため。
+    ///
+    /// 本番は 1919。試験用のネットワークは他のポートと同じ規則で
+    /// 10000 ずつずらす。
     pub const fn mining_port(self) -> u16 {
-        self.p2p_port() + 2
+        match self {
+            Network::Mainnet => 1919,
+            Network::Testnet => 11919,
+            Network::Regtest => 21919,
+        }
     }
 
     /// P2P の既定バインドアドレス。外部からの接続受け入れが前提。
@@ -159,7 +166,7 @@ mod tests {
                 Network::Mainnet.rpc_port(),
                 Network::Mainnet.mining_port()
             ),
-            (9444, 9445, 9446)
+            (9444, 9445, 1919)
         );
         assert_eq!(
             (
@@ -167,7 +174,7 @@ mod tests {
                 Network::Testnet.rpc_port(),
                 Network::Testnet.mining_port()
             ),
-            (19444, 19445, 19446)
+            (19444, 19445, 11919)
         );
         assert_eq!(
             (
@@ -175,7 +182,7 @@ mod tests {
                 Network::Regtest.rpc_port(),
                 Network::Regtest.mining_port()
             ),
-            (29444, 29445, 29446)
+            (29444, 29445, 21919)
         );
     }
 

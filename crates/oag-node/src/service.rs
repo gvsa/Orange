@@ -205,6 +205,17 @@ pub struct HeadersAccepted {
     pub total: usize,
 }
 
+/// 外の採掘器に配る仕事の土台 ([`NodeHandle::mining_job`])。
+#[derive(Debug, Clone)]
+pub struct MiningJob {
+    /// 掘る土台。ヘッダの `nonce` は 0 のまま。
+    pub template: oag_miner::BlockTemplate,
+    /// RandomX のシードの高さ。
+    pub seed_height: u64,
+    /// RandomX のシード (その高さのブロックハッシュ)。採掘器の鍵になる。
+    pub seed: Hash,
+}
+
 /// 専用スレッドへの要求。
 enum Request {
     Status(oneshot::Sender<Result<NodeStatus, String>>),
@@ -252,6 +263,17 @@ enum Request {
     },
     /// ピアが切れた。頼んでいた分を待ち行列に戻す。
     PeerGone(PeerId),
+    /// 外の採掘器に配る土台を組む (Stratum)。
+    MiningJob {
+        payout: Lock,
+        extra_nonce: u64,
+        reply: oneshot::Sender<Result<MiningJob, String>>,
+    },
+    /// ヘッダの PoW ハッシュを計算する (Stratum の答え合わせ)。
+    PowHash {
+        header: Box<BlockHeader>,
+        reply: oneshot::Sender<Result<Hash, String>>,
+    },
     /// 採掘を始める、または止める。
     SetMining {
         /// 受取先。`None` で止める。
@@ -715,6 +737,28 @@ impl NodeHandle {
             payout: Some(payout),
             blocks,
             mode,
+        })
+        .await
+    }
+
+    /// 外の採掘器に配る土台を組む。
+    ///
+    /// `extra_nonce` はコインベースに入る。接続ごとに変えれば、同じ受取先
+    /// でも土台が重ならない。
+    pub async fn mining_job(&self, payout: Lock, extra_nonce: u64) -> Result<MiningJob, String> {
+        self.ask(|reply| Request::MiningJob {
+            payout,
+            extra_nonce,
+            reply,
+        })
+        .await
+    }
+
+    /// ヘッダの PoW ハッシュ。難易度を満たすかどうかは見ない。
+    pub async fn pow_hash(&self, header: BlockHeader) -> Result<Hash, String> {
+        self.ask(|reply| Request::PowHash {
+            header: Box::new(header),
+            reply,
         })
         .await
     }
@@ -1492,6 +1536,17 @@ impl Service {
                 self.download.peer_disconnected(peer);
                 self.tx_requests.peer_disconnected(peer);
             }
+            Request::MiningJob {
+                payout,
+                extra_nonce,
+                reply,
+            } => {
+                let _ = reply.send(self.mining_job(&payout, extra_nonce));
+            }
+            Request::PowHash { header, reply } => {
+                let result = self.node.pow_hash(&header).map_err(|e| e.to_string());
+                let _ = reply.send(result);
+            }
             Request::SetMining {
                 payout,
                 blocks,
@@ -1774,6 +1829,25 @@ impl Service {
         Ok(HeadersAccepted {
             new,
             total: headers.len(),
+        })
+    }
+
+    /// 外の採掘器に配る土台を組む。
+    ///
+    /// 軽量モードは掘れない。チェーンの状態を持たないので土台が組めない。
+    fn mining_job(&self, payout: &Lock, extra_nonce: u64) -> Result<MiningJob, String> {
+        if self.light.is_some() {
+            return Err("a light node cannot mine".to_string());
+        }
+        let template = self
+            .node
+            .mining_template(payout, now(), extra_nonce)
+            .map_err(|e| e.to_string())?;
+        let (seed_height, seed) = self.node.mining_seed().map_err(|e| e.to_string())?;
+        Ok(MiningJob {
+            template,
+            seed_height,
+            seed,
         })
     }
 

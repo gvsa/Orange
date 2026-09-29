@@ -1671,9 +1671,9 @@ mempool は Compact Blocks の当たり外れに直結する**
 
 | ネットワーク | P2P | RPC | Mining |
 | --- | ---: | ---: | ---: |
-| mainnet | 9444 | 9445 | 9446 |
-| testnet | 19444 | 19445 | 19446 |
-| regtest | 29444 | 29445 | 29446 |
+| mainnet | 9444 | 9445 | 1919 |
+| testnet | 19444 | 19445 | 11919 |
+| regtest | 29444 | 29445 | 21919 |
 
 命名規則: `testnet = mainnet + 10000`、`regtest = mainnet + 20000`。
 
@@ -1719,6 +1719,8 @@ RPC を外部に公開した結果として資金を喪失する事故は、Bitc
 
 マイニング用インタフェースを RPC と分離する理由は、マイナーの接続を許可するために
 RPC を外部公開せざるを得ない状況を構造的に避けるためである。
+マイニング用インタフェースの中身 (Stratum) は [STRATUM.md](STRATUM.md) にある。
+合意ルールの外の取り決めなので、本書には含めない。
 
 ### 14.2 マジックバイト
 
@@ -3514,9 +3516,9 @@ RECOMMENDED_CONFIRMATIONS   10 ブロック     (約 10 分。SPEC §10.7)
 ゼロ承認                     受け取ってはならない
 
 ━━━ ネットワーク ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-mainnet P2P/RPC/Mining      9444 / 9445 / 9446
-testnet P2P/RPC/Mining      19444 / 19445 / 19446
-regtest P2P/RPC/Mining      29444 / 29445 / 29446
+mainnet P2P/RPC/Mining      9444 / 9445 / 1919
+testnet P2P/RPC/Mining      19444 / 19445 / 11919
+regtest P2P/RPC/Mining      29444 / 29445 / 21919
 RPC/Mining バインド既定値     127.0.0.1 のみ
 住所帳 new 表                1,024 バケット × 64
 住所帳 tried 表              256 バケット × 64

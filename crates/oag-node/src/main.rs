@@ -152,6 +152,20 @@ enum Command {
         /// The private key (PEM) for the wallet interface. Pass with `--tls-cert`.
         #[arg(long, value_name = "path", requires = "tls_cert")]
         tls_key: Option<PathBuf>,
+        /// Hand out jobs to external miners such as XMRig, over Stratum.
+        ///
+        /// Defaults to `127.0.0.1:1919` on mainnet. Point the miner at it with
+        /// your OAG address as the login; each block it finds pays that address.
+        ///
+        /// **Stock XMRig cannot mine OAG.** The nonce sits at a different place
+        /// in the header and the target is read the other way round, so it needs
+        /// the OAG build of XMRig (algorithm `rx/oag`). See docs/STRATUM.md.
+        ///
+        /// Binding to anything but loopback lets other machines mine through this
+        /// node, for example the rigs on your own network. Each finds blocks for
+        /// whatever address it logs in with.
+        #[arg(long, value_name = "address", num_args = 0..=1, conflicts_with = "light")]
+        stratum: Option<Option<SocketAddr>>,
         /// Throw away rollback data older than this many blocks. Off by default.
         ///
         /// Rollback data is only ever read when the chain reorganises back over a
@@ -342,6 +356,7 @@ fn run() -> Result<(), String> {
             wallet,
             tls_cert,
             tls_key,
+            stratum,
             prune_undo,
             prune,
             light,
@@ -538,6 +553,22 @@ fn run() -> Result<(), String> {
                         println!(
                             "the wallet runs without history on a pruned node; balances \
                              and sending are unaffected"
+                        );
+                    }
+                }
+
+                if let Some(addr) = stratum {
+                    let addr = addr.unwrap_or_else(|| oag_node::stratum::default_addr(network));
+                    let bound = oag_node::stratum::start_stratum(handle.clone(), addr).await?;
+                    println!(
+                        "stratum open at {bound} for miners that speak {} (see docs/STRATUM.md)",
+                        oag_node::stratum::ALGO
+                    );
+                    if !bound.ip().is_loopback() {
+                        oag_node::log_warn!(
+                            "stratum is reachable from other machines: anyone who can reach \
+                             {bound} can mine through this node, paying whatever address \
+                             they log in with"
                         );
                     }
                 }

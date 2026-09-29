@@ -514,6 +514,18 @@ impl Node {
         }
     }
 
+    /// ヘッダの PoW ハッシュを計算する。
+    ///
+    /// 外の採掘器 (Stratum) が出してきた答えを確かめるのに使う。難易度を
+    /// 満たすかどうかはここでは見ない。**ハッシュそのものを返す**のは、
+    /// 採掘器が申告した値と突き合わせ、ずれていれば「何が違うのか」を
+    /// 言えるようにするためである。
+    pub fn pow_hash(&mut self, header: &BlockHeader) -> Result<Hash, NodeError> {
+        self.with_verifier(header.height, &header.prev_hash, |_, verifier| {
+            Ok(verifier.hash_header(header)?)
+        })
+    }
+
     /// 次のブロックを掘るときの RandomX シード (高さと値)。
     ///
     /// 採掘器はこれで建てる。**エポックが変われば建て直しである。**
