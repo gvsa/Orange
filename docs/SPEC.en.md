@@ -488,7 +488,9 @@ The operational boundary is therefore:
    gaps.
 3. Open a pull request against `satoshilabs/slips` adding one row to the table in
    `slip-0044.md`. The table has three columns: `Coin type | Symbol | Coin`.
-   **Submitted: `satoshilabs/slips` pull request #2061. Awaiting review.**
+   **Submitted: `satoshilabs/slips` pull request #2062. Awaiting review.**
+   (#2061, opened earlier for 1031, was closed because another request had
+   claimed that number first)
 
 The number applied for is **1033**. It is a gap between 1032 and 1042, and
 neither `OAG` nor `Orange` is registered.
@@ -3332,7 +3334,7 @@ Items to be decided during implementation.
 - [ ] **Register the mainnet SLIP-0044 coin type**
       ([§6.6](#66-hd-wallets)). The BIP44-capable wallet that the application
       presupposed is implemented, and
-      **`satoshilabs/slips` pull request #2061 has been submitted for number
+      **`satoshilabs/slips` pull request #2062 has been submitted for number
       1033 and is awaiting review.** The implementation carries 1033 and can
       derive mainnet keys. testnet uses reserved number 1 and does not depend on
       this registration. Since neither acceptance nor timing is guaranteed, it is
