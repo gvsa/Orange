@@ -30,9 +30,10 @@
 use crate::index::{BlockIndex, BlockIndexEntry, BlockStatus, EntryCache};
 use crate::store::ChainStore;
 use oag_consensus::params;
+use oag_consensus::utxo::UtxoError;
 use oag_consensus::validate::{
-    median_time_past, validate_block, validate_header, AcceptAnyPow, BlockContext, HeaderContext,
-    PowVerifier, SignatureChecks, ValidationError,
+    median_time_past, validate_block, validate_header, AcceptAnyPow, BlockContext, ChainTimes,
+    HeaderContext, PowVerifier, SignatureChecks, ValidationError,
 };
 use oag_consensus::{Block, BlockHeader};
 use oag_pow::lwma::{self, LwmaError};
@@ -201,6 +202,43 @@ pub struct Chain<S: ChainStore> {
     ///
     /// 引くのは `&self` の経路なので、窓を持つには内側の可変性が要る。
     assume_valid: RefCell<Option<AssumeValid>>,
+    /// 相対 locktime の強制が始まる高さ (`docs/SPEC.md` §7.5)。
+    relative_locktime_height: u64,
+}
+
+/// ある枝の上で、過去のブロックの Median Time Past を答える
+/// ([`ChainTimes`])。[`Chain::times_on`] で作る。
+///
+/// アクティブチェーンの高さの索引ではなく、**指定した先端からの祖先**を
+/// たどる。検証しているブロックの枝と、索引が指す枝が食い違っていても
+/// 取り違えない。
+pub struct BranchTimes<'c, S: ChainStore> {
+    chain: &'c Chain<S>,
+    tip: Hash,
+}
+
+impl<S: ChainStore> ChainTimes for BranchTimes<'_, S> {
+    fn median_time_past_at(&self, height: u64) -> Result<i64, UtxoError> {
+        let Some(parent_height) = height.checked_sub(1) else {
+            // 高さ 0 には親が無い。下限を置かない。
+            return Ok(i64::MIN);
+        };
+        // 引けないのは記憶域か呼び出し側の誤りであり、ブロックの誤りでは
+        // ない。どちらも記憶域の失敗として返し、無効の印を付けさせない。
+        let parent = self
+            .chain
+            .ancestor_hash_at(&self.tip, parent_height)
+            .map_err(|e| UtxoError::Backend(e.to_string()))?
+            .ok_or_else(|| {
+                UtxoError::Backend(format!(
+                    "no ancestor at height {parent_height} on the branch of {}",
+                    self.tip
+                ))
+            })?;
+        self.chain
+            .median_time_past_for_child_of(&parent)
+            .map_err(|e| UtxoError::Backend(e.to_string()))
+    }
 }
 
 impl<S: ChainStore> Chain<S> {
@@ -285,6 +323,7 @@ impl<S: ChainStore> Chain<S> {
             genesis_difficulty,
             retarget,
             assume_valid: RefCell::new(None),
+            relative_locktime_height: 0,
         })
     }
 
@@ -464,6 +503,28 @@ impl<S: ChainStore> Chain<S> {
             window: Vec::new(),
             limit: ASSUME_VALID_WINDOW,
         });
+    }
+
+    /// 相対 locktime の強制が始まる高さを決める (`docs/SPEC.md` §7.5)。
+    ///
+    /// **既定は 0 (最初から強制する) である。** ノードはネットワークごとの
+    /// 値 (`Network::relative_locktime_height`) を必ず渡すこと。強制より前に
+    /// 作られた mainnet のブロックを、強制ありで検証してはならない。
+    pub fn set_relative_locktime_height(&mut self, height: u64) {
+        self.relative_locktime_height = height;
+    }
+
+    /// 相対 locktime の強制が始まる高さ。
+    pub fn relative_locktime_height(&self) -> u64 {
+        self.relative_locktime_height
+    }
+
+    /// `tip` の枝の上で、過去のブロックの Median Time Past を引く口。
+    ///
+    /// `tip` には、検証するブロックの**親**か、mempool なら現在の先端を
+    /// 渡す。高さ `tip + 1` まで答えられる。
+    pub fn times_on(&self, tip: Hash) -> BranchTimes<'_, S> {
+        BranchTimes { chain: self, tip }
     }
 
     /// 設定されている assumevalid のブロック。
@@ -969,10 +1030,13 @@ impl<S: ChainStore> Chain<S> {
 
         {
             let view = self.store.utxo_view().map_err(Self::store_err)?;
+            let times = self.times_on(parent_hash);
             let ctx = BlockContext {
                 header: header_ctx,
                 utxo: &view,
                 signature_checks: self.signature_checks_for(&hash, height)?,
+                relative_locktime: (height >= self.relative_locktime_height)
+                    .then_some(&times as &dyn ChainTimes),
             };
             validate_block(&block, &ctx, &AcceptAnyPow)?;
         }

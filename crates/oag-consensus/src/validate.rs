@@ -15,7 +15,9 @@ use crate::params;
 #[cfg(test)]
 use crate::sighash::sighash;
 use crate::sighash::{SighashCache, SighashError, SighashType};
-use crate::tx::{decode_coinbase_height, Transaction, TxOutput, LOCKTIME_THRESHOLD};
+use crate::tx::{
+    decode_coinbase_height, RelativeLocktime, Transaction, TxOutput, LOCKTIME_THRESHOLD,
+};
 use crate::utxo::{OverlayView, UtxoEntry, UtxoError, UtxoView};
 use oag_primitives::address::VERSION_PUBKEY;
 use oag_primitives::{Amount, Hash, PublicKey, Signature};
@@ -85,6 +87,29 @@ pub enum SignatureChecks {
     Skip,
 }
 
+/// 過去のブロックの Median Time Past を引く口 (SPEC §7.5)。
+///
+/// 時間で指定した相対 locktime は、参照先の出力が入ったブロックの時刻から
+/// 数える。その時刻は UTXO には記録されていないので、チェーンに聞く。
+///
+/// # 引くのは検証しているブロックの祖先であること
+///
+/// 実装は、**いま検証しているブロック (またはトランザクションが入りうる
+/// 次のブロック) の祖先**について答えなければならない。分岐の別の枝の
+/// 時刻を返すと、同じブロックがノードによって有効にも無効にもなる。
+pub trait ChainTimes {
+    /// 高さ `height` のブロックを検証したときの Median Time Past。
+    ///
+    /// すなわち、高さ `height - 1` までの直近 11 ブロックのタイムスタンプの
+    /// 中央値である (SPEC §7.4)。高さ 0 には親が無いので `i64::MIN` を
+    /// 返す。
+    ///
+    /// 記憶域が読めなかったときは [`UtxoError::Backend`] を返すこと。
+    /// それは「ブロックが不正である」こととは区別される
+    /// ([`ValidationError::is_storage_failure`])。
+    fn median_time_past_at(&self, height: u64) -> Result<i64, UtxoError>;
+}
+
 /// ブロック全体を検証するために必要な文脈。
 pub struct BlockContext<'a> {
     /// ヘッダの検証に必要な文脈。
@@ -93,6 +118,11 @@ pub struct BlockContext<'a> {
     pub utxo: &'a dyn UtxoView,
     /// 署名を検証するか。**迷ったら [`SignatureChecks::Verify`]。**
     pub signature_checks: SignatureChecks,
+    /// 相対 locktime を強制するか (SPEC §7.5)。
+    ///
+    /// 強制が有効になる高さ以降のブロックでは `Some` を渡す。それより前の
+    /// ブロックは強制なしで作られたので、`None` で検証しなければならない。
+    pub relative_locktime: Option<&'a dyn ChainTimes>,
 }
 
 /// 検証の失敗。
@@ -268,6 +298,14 @@ pub enum ValidationError {
         /// Median Time Past。
         time: i64,
     },
+    /// 相対 locktime の条件を満たしていない (SPEC §7.5)。
+    #[error("the relative locktime of input {index} ({locktime:?}) is not satisfied")]
+    RelativeLocktimeNotSatisfied {
+        /// 入力番号。
+        index: usize,
+        /// その入力の相対 locktime。
+        locktime: RelativeLocktime,
+    },
 }
 
 impl ValidationError {
@@ -313,6 +351,9 @@ pub struct TransactionSummary {
 ///
 /// `utxo` は、このトランザクションより前の状態を反映したビューでなければ
 /// ならない。コインベースは本関数の対象外である。
+///
+/// `relative_locktime` が `Some` なら相対 locktime を強制する
+/// ([`BlockContext::relative_locktime`])。
 pub fn validate_transaction(
     tx: &Transaction,
     utxo: &dyn UtxoView,
@@ -320,6 +361,7 @@ pub fn validate_transaction(
     median_time_past: i64,
     index: usize,
     signature_checks: SignatureChecks,
+    relative_locktime: Option<&dyn ChainTimes>,
 ) -> Result<TransactionSummary, ValidationError> {
     if tx.inputs.is_empty() {
         return Err(ValidationError::NoInputs { index });
@@ -384,6 +426,11 @@ pub fn validate_transaction(
         });
     }
 
+    // 相対 locktime。
+    if let Some(times) = relative_locktime {
+        check_relative_locktimes(tx, &spent_entries, height, median_time_past, times)?;
+    }
+
     // 署名。
     //
     // **中間ハッシュは 1 回だけ作る。** 入力ごとに作り直すと、同じものを
@@ -407,6 +454,48 @@ fn locktime_is_satisfied(tx: &Transaction, height: u64, median_time_past: i64) -
     } else {
         i128::from(median_time_past) >= i128::from(tx.locktime)
     }
+}
+
+/// すべての入力の相対 locktime を満たしているか (SPEC §7.5)。
+///
+/// `spent` は各入力が参照する UTXO を入力と同じ順で並べたもの。
+///
+/// 数え始めは**参照先の出力が入ったブロック**である。ブロック数なら
+/// その高さから、時間ならそのブロックを検証したときの Median Time Past
+/// から数える。条件は §7.4 と同じく 1 つずれない形で書く。
+///
+/// ```text
+/// ブロック数:  height           ≥ 出力の高さ + 値
+/// 時間:        median_time_past ≥ 出力の高さの Median Time Past + 値 × 512
+/// ```
+///
+/// BIP68 と同じ結果になる。BIP68 は「最小値 − 1 < 現在」と書くが、
+/// 整数では「最小値 ≤ 現在」と同じである。
+fn check_relative_locktimes(
+    tx: &Transaction,
+    spent: &[UtxoEntry],
+    height: u64,
+    median_time_past: i64,
+    times: &dyn ChainTimes,
+) -> Result<(), ValidationError> {
+    for (index, entry) in spent.iter().enumerate() {
+        let Some(locktime) = tx.relative_locktime(index) else {
+            continue;
+        };
+        let satisfied = match locktime {
+            RelativeLocktime::Blocks(blocks) => {
+                u128::from(height) >= u128::from(entry.height) + u128::from(blocks)
+            }
+            RelativeLocktime::Seconds(seconds) => {
+                let since = times.median_time_past_at(entry.height)?;
+                i128::from(median_time_past) >= i128::from(since) + i128::from(seconds)
+            }
+        };
+        if !satisfied {
+            return Err(ValidationError::RelativeLocktimeNotSatisfied { index, locktime });
+        }
+    }
+    Ok(())
 }
 
 /// 1 入力分の署名を検証する。
@@ -605,6 +694,7 @@ pub fn validate_block(
             ctx.header.median_time_past,
             index,
             ctx.signature_checks,
+            ctx.relative_locktime,
         )?;
 
         // (c) ビューへ反映する。
@@ -792,6 +882,7 @@ mod tests {
                     now: NOW,
                 },
                 utxo: &self.utxo,
+                relative_locktime: None,
             }
         }
 
@@ -1080,15 +1171,29 @@ mod tests {
         // 119 ブロック経過では未成熟。
         let too_early = 1 + params::COINBASE_MATURITY - 1;
         assert!(matches!(
-            validate_transaction(&tx, &f.utxo, too_early, MTP, 1, SignatureChecks::Verify),
+            validate_transaction(
+                &tx,
+                &f.utxo,
+                too_early,
+                MTP,
+                1,
+                SignatureChecks::Verify,
+                None
+            ),
             Err(ValidationError::ImmatureCoinbase { .. })
         ));
 
         // 120 ブロック経過で使用できる。
-        assert!(
-            validate_transaction(&tx, &f.utxo, SPEND_HEIGHT, MTP, 1, SignatureChecks::Verify)
-                .is_ok()
-        );
+        assert!(validate_transaction(
+            &tx,
+            &f.utxo,
+            SPEND_HEIGHT,
+            MTP,
+            1,
+            SignatureChecks::Verify,
+            None
+        )
+        .is_ok());
     }
 
     #[test]
@@ -1097,7 +1202,15 @@ mod tests {
         let mut tx = f.spend("0.001");
         tx.inputs[0].prev_out = OutPoint::new(hash::txid(b"ghost"), 0);
         assert_eq!(
-            validate_transaction(&tx, &f.utxo, SPEND_HEIGHT, MTP, 1, SignatureChecks::Verify),
+            validate_transaction(
+                &tx,
+                &f.utxo,
+                SPEND_HEIGHT,
+                MTP,
+                1,
+                SignatureChecks::Verify,
+                None
+            ),
             Err(ValidationError::MissingUtxo)
         );
     }
@@ -1109,7 +1222,15 @@ mod tests {
         let input = tx.inputs[0].clone();
         tx.inputs.push(input);
         assert_eq!(
-            validate_transaction(&tx, &f.utxo, SPEND_HEIGHT, MTP, 1, SignatureChecks::Verify),
+            validate_transaction(
+                &tx,
+                &f.utxo,
+                SPEND_HEIGHT,
+                MTP,
+                1,
+                SignatureChecks::Verify,
+                None
+            ),
             Err(ValidationError::DuplicateInput)
         );
     }
@@ -1121,7 +1242,15 @@ mod tests {
         tx.outputs[0].amount = params::BLOCK_REWARD.checked_add(Amount::ONE_OAG).unwrap();
         sign(&mut tx, std::slice::from_ref(&f.funded_output), &[&f.key]);
         assert!(matches!(
-            validate_transaction(&tx, &f.utxo, SPEND_HEIGHT, MTP, 1, SignatureChecks::Verify),
+            validate_transaction(
+                &tx,
+                &f.utxo,
+                SPEND_HEIGHT,
+                MTP,
+                1,
+                SignatureChecks::Verify,
+                None
+            ),
             Err(ValidationError::OutputsExceedInputs { .. })
         ));
     }
@@ -1132,7 +1261,15 @@ mod tests {
         let mut tx = f.spend("0.001");
         tx.outputs.clear();
         assert_eq!(
-            validate_transaction(&tx, &f.utxo, SPEND_HEIGHT, MTP, 3, SignatureChecks::Verify),
+            validate_transaction(
+                &tx,
+                &f.utxo,
+                SPEND_HEIGHT,
+                MTP,
+                3,
+                SignatureChecks::Verify,
+                None
+            ),
             Err(ValidationError::NoOutputs { index: 3 })
         );
     }
@@ -1145,7 +1282,15 @@ mod tests {
         let mut tx = f.spend("0.001");
         tx.outputs[0].amount = Amount::from_oag(1).unwrap();
         assert_eq!(
-            validate_transaction(&tx, &f.utxo, SPEND_HEIGHT, MTP, 1, SignatureChecks::Verify),
+            validate_transaction(
+                &tx,
+                &f.utxo,
+                SPEND_HEIGHT,
+                MTP,
+                1,
+                SignatureChecks::Verify,
+                None
+            ),
             Err(ValidationError::BadSignature { index: 0 })
         );
     }
@@ -1157,7 +1302,15 @@ mod tests {
         let other = SecretKey::generate();
         sign(&mut tx, std::slice::from_ref(&f.funded_output), &[&other]);
         assert_eq!(
-            validate_transaction(&tx, &f.utxo, SPEND_HEIGHT, MTP, 1, SignatureChecks::Verify),
+            validate_transaction(
+                &tx,
+                &f.utxo,
+                SPEND_HEIGHT,
+                MTP,
+                1,
+                SignatureChecks::Verify,
+                None
+            ),
             Err(ValidationError::BadSignature { index: 0 })
         );
     }
@@ -1169,7 +1322,15 @@ mod tests {
             let mut tx = f.spend("0.001");
             tx.inputs[0].signature = vec![0u8; len];
             assert_eq!(
-                validate_transaction(&tx, &f.utxo, SPEND_HEIGHT, MTP, 1, SignatureChecks::Verify),
+                validate_transaction(
+                    &tx,
+                    &f.utxo,
+                    SPEND_HEIGHT,
+                    MTP,
+                    1,
+                    SignatureChecks::Verify,
+                    None
+                ),
                 Err(ValidationError::BadSignatureLength(len))
             );
         }
@@ -1185,10 +1346,16 @@ mod tests {
         let mut sig = f.key.sign(&msg).to_bytes().to_vec();
         sig.push(t.to_byte());
         tx.inputs[0].signature = sig;
-        assert!(
-            validate_transaction(&tx, &f.utxo, SPEND_HEIGHT, MTP, 1, SignatureChecks::Verify)
-                .is_ok()
-        );
+        assert!(validate_transaction(
+            &tx,
+            &f.utxo,
+            SPEND_HEIGHT,
+            MTP,
+            1,
+            SignatureChecks::Verify,
+            None
+        )
+        .is_ok());
     }
 
     #[test]
@@ -1199,7 +1366,15 @@ mod tests {
         sig.push(0x7f);
         tx.inputs[0].signature = sig;
         assert!(matches!(
-            validate_transaction(&tx, &f.utxo, SPEND_HEIGHT, MTP, 1, SignatureChecks::Verify),
+            validate_transaction(
+                &tx,
+                &f.utxo,
+                SPEND_HEIGHT,
+                MTP,
+                1,
+                SignatureChecks::Verify,
+                None
+            ),
             Err(ValidationError::Sighash(SighashError::UnknownType(0x7f)))
         ));
     }
@@ -1242,7 +1417,16 @@ mod tests {
             locktime: 0,
         };
         assert!(
-            validate_transaction(&tx, &utxo, SPEND_HEIGHT, MTP, 1, SignatureChecks::Verify).is_ok(),
+            validate_transaction(
+                &tx,
+                &utxo,
+                SPEND_HEIGHT,
+                MTP,
+                1,
+                SignatureChecks::Verify,
+                None
+            )
+            .is_ok(),
             "an unknown version must be spendable by anyone"
         );
     }
@@ -1272,7 +1456,15 @@ mod tests {
         let mut empty = base.clone();
         empty.inputs[0].signature = Vec::new();
         assert_eq!(
-            validate_transaction(&empty, &utxo, SPEND_HEIGHT, MTP, 1, SignatureChecks::Verify),
+            validate_transaction(
+                &empty,
+                &utxo,
+                SPEND_HEIGHT,
+                MTP,
+                1,
+                SignatureChecks::Verify,
+                None
+            ),
             Err(ValidationError::BadSignatureLength(0)),
             "it was spendable without a signature"
         );
@@ -1287,7 +1479,8 @@ mod tests {
                 SPEND_HEIGHT,
                 MTP,
                 1,
-                SignatureChecks::Verify
+                SignatureChecks::Verify,
+                None
             ),
             Err(ValidationError::BadLockPubkey { index: 0 }),
             "verification proceeded to the signature for the zero key"
@@ -1305,7 +1498,8 @@ mod tests {
                 SPEND_HEIGHT,
                 MTP,
                 1,
-                SignatureChecks::Verify
+                SignatureChecks::Verify,
+                None
             ),
             Err(ValidationError::BadLockPubkey { index: 0 }),
             "it could be spent by signing with our own key"
@@ -1332,7 +1526,15 @@ mod tests {
         sign(&mut tx, std::slice::from_ref(&f.funded_output), &[&f.key]);
 
         assert!(matches!(
-            validate_transaction(&tx, &f.utxo, SPEND_HEIGHT, MTP, 1, SignatureChecks::Verify),
+            validate_transaction(
+                &tx,
+                &f.utxo,
+                SPEND_HEIGHT,
+                MTP,
+                1,
+                SignatureChecks::Verify,
+                None
+            ),
             Err(ValidationError::LocktimeNotSatisfied { .. })
         ));
         // locktime と同じ高さで有効になる。
@@ -1342,7 +1544,8 @@ mod tests {
             SPEND_HEIGHT + 1,
             MTP,
             1,
-            SignatureChecks::Verify
+            SignatureChecks::Verify,
+            None
         )
         .is_ok());
     }
@@ -1356,7 +1559,15 @@ mod tests {
 
         assert!(tx.locktime >= LOCKTIME_THRESHOLD);
         assert!(matches!(
-            validate_transaction(&tx, &f.utxo, SPEND_HEIGHT, MTP, 1, SignatureChecks::Verify),
+            validate_transaction(
+                &tx,
+                &f.utxo,
+                SPEND_HEIGHT,
+                MTP,
+                1,
+                SignatureChecks::Verify,
+                None
+            ),
             Err(ValidationError::LocktimeNotSatisfied { .. })
         ));
         assert!(validate_transaction(
@@ -1365,9 +1576,315 @@ mod tests {
             SPEND_HEIGHT,
             MTP + 100,
             1,
-            SignatureChecks::Verify
+            SignatureChecks::Verify,
+            None
         )
         .is_ok());
+    }
+
+    // ━━━━━━━━ 相対 locktime (SPEC §7.5) ━━━━━━━━
+
+    /// 高さごとの Median Time Past を固定で答える。`fail` なら記憶域の
+    /// 失敗を装う。
+    struct Times {
+        at: fn(u64) -> i64,
+        fail: bool,
+    }
+
+    impl ChainTimes for Times {
+        fn median_time_past_at(&self, height: u64) -> Result<i64, UtxoError> {
+            if self.fail {
+                return Err(UtxoError::Backend("disk".into()));
+            }
+            Ok((self.at)(height))
+        }
+    }
+
+    /// 資金 (高さ 1 の出力) の Median Time Past。
+    const COIN_MTP: i64 = MTP - 100_000;
+
+    fn times() -> Times {
+        Times {
+            at: |height| {
+                assert_eq!(height, 1, "asked about a block other than the coin's");
+                COIN_MTP
+            },
+            fail: false,
+        }
+    }
+
+    /// 版数 2、`sequence` を指定して署名し直した支払い。
+    fn relative_spend(f: &Fixture, version: u32, sequence: u32) -> Transaction {
+        let mut tx = f.spend("0.001");
+        tx.version = version;
+        tx.inputs[0].sequence = sequence;
+        sign(&mut tx, std::slice::from_ref(&f.funded_output), &[&f.key]);
+        tx
+    }
+
+    fn check(
+        f: &Fixture,
+        tx: &Transaction,
+        height: u64,
+        mtp: i64,
+        times: Option<&dyn ChainTimes>,
+    ) -> Result<TransactionSummary, ValidationError> {
+        validate_transaction(tx, &f.utxo, height, mtp, 1, SignatureChecks::Verify, times)
+    }
+
+    #[test]
+    fn relative_locktime_in_blocks() {
+        let f = fixture();
+        // 資金は高さ 1。200 ブロック待つので、使えるのは高さ 201 から。
+        let tx = relative_spend(&f, 2, 200);
+        let t = times();
+
+        assert_eq!(
+            check(&f, &tx, 200, MTP, Some(&t)),
+            Err(ValidationError::RelativeLocktimeNotSatisfied {
+                index: 0,
+                locktime: RelativeLocktime::Blocks(200),
+            })
+        );
+        // ちょうど 200 ブロック経った高さで有効になる。1 つずれない。
+        assert!(check(&f, &tx, 201, MTP, Some(&t)).is_ok());
+        assert!(check(&f, &tx, 10_000, MTP, Some(&t)).is_ok());
+    }
+
+    #[test]
+    fn zero_blocks_is_always_satisfied() {
+        let f = fixture();
+        let tx = relative_spend(&f, 2, 0);
+        assert!(check(&f, &tx, SPEND_HEIGHT, MTP, Some(&times())).is_ok());
+    }
+
+    #[test]
+    fn relative_locktime_in_time() {
+        let f = fixture();
+        // 3 × 512 = 1536 秒。資金のブロックの MTP から数える。
+        let tx = relative_spend(&f, 2, crate::tx::SEQUENCE_TYPE_FLAG | 3);
+        let t = times();
+
+        assert_eq!(
+            check(&f, &tx, 10_000, COIN_MTP + 1535, Some(&t)),
+            Err(ValidationError::RelativeLocktimeNotSatisfied {
+                index: 0,
+                locktime: RelativeLocktime::Seconds(1536),
+            })
+        );
+        assert!(check(&f, &tx, 10_000, COIN_MTP + 1536, Some(&t)).is_ok());
+    }
+
+    #[test]
+    fn time_is_counted_from_the_coins_block_not_from_the_tip() {
+        let f = fixture();
+        let tx = relative_spend(&f, 2, crate::tx::SEQUENCE_TYPE_FLAG | 1);
+        // 資金のブロックの時刻が新しければ、同じ「現在」でも満たさない。
+        let late = Times {
+            at: |_| MTP,
+            fail: false,
+        };
+        assert!(check(&f, &tx, 10_000, MTP + 511, Some(&late)).is_err());
+        assert!(check(&f, &tx, 10_000, MTP + 512, Some(&late)).is_ok());
+    }
+
+    #[test]
+    fn version_one_ignores_the_sequence() {
+        let f = fixture();
+        // 無効化ビットが落ちていても、版数 1 なら何も課さない。
+        let tx = relative_spend(&f, 1, 60_000);
+        assert!(check(&f, &tx, SPEND_HEIGHT, MTP, Some(&times())).is_ok());
+    }
+
+    #[test]
+    fn the_disable_flag_turns_it_off() {
+        let f = fixture();
+        let tx = relative_spend(&f, 2, crate::tx::SEQUENCE_DISABLE_FLAG | 60_000);
+        assert!(check(&f, &tx, SPEND_HEIGHT, MTP, Some(&times())).is_ok());
+    }
+
+    #[test]
+    fn nothing_is_enforced_before_activation() {
+        let f = fixture();
+        let tx = relative_spend(&f, 2, 60_000);
+        assert!(check(&f, &tx, SPEND_HEIGHT, MTP, Some(&times())).is_err());
+        assert!(check(&f, &tx, SPEND_HEIGHT, MTP, None).is_ok());
+    }
+
+    #[test]
+    fn a_failing_time_lookup_is_a_storage_failure() {
+        let f = fixture();
+        let tx = relative_spend(&f, 2, crate::tx::SEQUENCE_TYPE_FLAG | 1);
+        let broken = Times {
+            at: |_| 0,
+            fail: true,
+        };
+        let err = check(&f, &tx, SPEND_HEIGHT, MTP, Some(&broken)).unwrap_err();
+        // 読めなかっただけでブロックを無効にしてはならない。
+        assert!(err.is_storage_failure(), "{err:?}");
+
+        // ブロック数で指定したものは時刻を引かないので、失敗しない。
+        let by_blocks = relative_spend(&f, 2, 1);
+        assert!(check(&f, &by_blocks, SPEND_HEIGHT, MTP, Some(&broken)).is_ok());
+    }
+
+    #[test]
+    fn every_input_is_checked() {
+        // 2 つ目の入力だけが満たさない場合も拒否する。
+        let f = fixture();
+        let key2 = SecretKey::generate();
+        let output2 = TxOutput::new(
+            params::BLOCK_REWARD,
+            Lock::pay_to_pubkey(&key2.public_key()),
+        );
+        let cb2 = coinbase(2, vec![output2.clone()]);
+        let mut utxo = f.utxo.clone();
+        utxo.apply_block(std::slice::from_ref(&cb2), 2).unwrap();
+
+        let mut tx = Transaction {
+            version: 2,
+            inputs: vec![
+                TxInput::new(f.funded),
+                TxInput::new(OutPoint::new(cb2.txid(), 0)),
+            ],
+            outputs: vec![TxOutput::new(
+                params::BLOCK_REWARD,
+                Lock::pay_to_pubkey(&SecretKey::generate().public_key()),
+            )],
+            locktime: 0,
+        };
+        tx.inputs[0].sequence = 10;
+        tx.inputs[1].sequence = 200;
+        let spent = [f.funded_output.clone(), output2];
+        sign(&mut tx, &spent, &[&f.key, &key2]);
+
+        // 入力 1 は高さ 2 から 200 ブロック、つまり高さ 202 から。
+        let t = Times {
+            at: |_| COIN_MTP,
+            fail: false,
+        };
+        let at = |height| {
+            validate_transaction(
+                &tx,
+                &utxo,
+                height,
+                MTP,
+                1,
+                SignatureChecks::Verify,
+                Some(&t),
+            )
+        };
+        assert_eq!(
+            at(201),
+            Err(ValidationError::RelativeLocktimeNotSatisfied {
+                index: 1,
+                locktime: RelativeLocktime::Blocks(200),
+            })
+        );
+        assert!(at(202).is_ok());
+    }
+
+    #[test]
+    fn blocks_enforce_it_only_when_told_to() {
+        let f = fixture();
+        let spend = relative_spend(&f, 2, 60_000);
+        let fee: Amount = "0.001".parse().unwrap();
+        let cb = coinbase(
+            SPEND_HEIGHT,
+            vec![TxOutput::new(
+                params::block_subsidy(SPEND_HEIGHT)
+                    .checked_add(fee)
+                    .unwrap(),
+                Lock::pay_to_pubkey(&SecretKey::generate().public_key()),
+            )],
+        );
+        let block = make_block(SPEND_HEIGHT, f.tip, vec![cb, spend]);
+
+        assert!(validate_block(&block, &f.context(), &AcceptAnyPow).is_ok());
+
+        let t = times();
+        let mut ctx = f.context();
+        ctx.relative_locktime = Some(&t);
+        assert!(matches!(
+            validate_block(&block, &ctx, &AcceptAnyPow),
+            Err(ValidationError::RelativeLocktimeNotSatisfied { index: 0, .. })
+        ));
+    }
+
+    #[test]
+    fn an_output_from_the_same_block_counts_from_this_block() {
+        // 同じブロックの前の取引が作った出力は、このブロックの高さで
+        // 生まれている。0 ブロックなら使え、1 ブロックなら使えない。
+        let f = fixture();
+        let middle_key = SecretKey::generate();
+        let mut first = f.spend("0.001");
+        first.outputs[0].lock = Lock::pay_to_pubkey(&middle_key.public_key());
+        sign(
+            &mut first,
+            std::slice::from_ref(&f.funded_output),
+            &[&f.key],
+        );
+        let first_out = first.outputs[0].clone();
+
+        let second_with = |sequence: u32| {
+            let mut second = Transaction {
+                version: 2,
+                inputs: vec![TxInput::new(OutPoint::new(first.txid(), 0))],
+                outputs: vec![TxOutput::new(
+                    first_out.amount.checked_sub(fee_of("0.001")).unwrap(),
+                    Lock::pay_to_pubkey(&SecretKey::generate().public_key()),
+                )],
+                locktime: 0,
+            };
+            second.inputs[0].sequence = sequence;
+            sign(
+                &mut second,
+                std::slice::from_ref(&first_out),
+                &[&middle_key],
+            );
+            second
+        };
+        let block_with = |second: Transaction| {
+            let cb = coinbase(
+                SPEND_HEIGHT,
+                vec![TxOutput::new(
+                    params::block_subsidy(SPEND_HEIGHT)
+                        .checked_add(fee_of("0.002"))
+                        .unwrap(),
+                    Lock::pay_to_pubkey(&SecretKey::generate().public_key()),
+                )],
+            );
+            make_block(SPEND_HEIGHT, f.tip, vec![cb, first.clone(), second])
+        };
+
+        let t = Times {
+            at: |height| {
+                assert_eq!(height, SPEND_HEIGHT);
+                MTP
+            },
+            fail: false,
+        };
+        let mut ctx = f.context();
+        ctx.relative_locktime = Some(&t);
+
+        assert!(validate_block(&block_with(second_with(0)), &ctx, &AcceptAnyPow).is_ok());
+        assert!(matches!(
+            validate_block(&block_with(second_with(1)), &ctx, &AcceptAnyPow),
+            Err(ValidationError::RelativeLocktimeNotSatisfied { .. })
+        ));
+        // 時間でも同じ。このブロックの MTP から数えるので、1 単位でも足りない。
+        assert!(matches!(
+            validate_block(
+                &block_with(second_with(crate::tx::SEQUENCE_TYPE_FLAG | 1)),
+                &ctx,
+                &AcceptAnyPow
+            ),
+            Err(ValidationError::RelativeLocktimeNotSatisfied { .. })
+        ));
+    }
+
+    fn fee_of(amount: &str) -> Amount {
+        amount.parse().unwrap()
     }
 
     // ━━━━━━━━ ブロック内の依存関係 ━━━━━━━━

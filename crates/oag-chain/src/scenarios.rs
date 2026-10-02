@@ -10,7 +10,10 @@ use crate::genesis::GenesisSpec;
 use crate::index::BlockStatus;
 use crate::store::ChainStore;
 use oag_consensus::lock::Lock;
-use oag_consensus::tx::{encode_coinbase_signature, OutPoint, TxInput, CURRENT_TX_VERSION};
+use oag_consensus::sighash::{sighash, SighashType};
+use oag_consensus::tx::{
+    encode_coinbase_signature, OutPoint, TxInput, CURRENT_TX_VERSION, SEQUENCE_TYPE_FLAG,
+};
 use oag_consensus::utxo::UtxoView;
 use oag_consensus::validate::AcceptAnyPow;
 use oag_consensus::{Block, BlockHeader, Transaction, TxOutput};
@@ -887,4 +890,93 @@ pub fn the_difficulty_rises_when_blocks_come_too_fast<S: ChainStore>(store: S) {
         DIFFICULTY,
         "difficulty moves as the target interval intends"
     );
+}
+
+// ━━━━━━━━ 相対 locktime (SPEC §7.5) ━━━━━━━━
+
+/// 相対 locktime の強制が、決めた高さのブロックから始まること。
+///
+/// 同じブロックを、強制の始まる高さだけが違う 2 本のチェーンに渡す。
+/// 開始より前の高さなら通り、開始の高さちょうどなら弾かれる。時間で指定
+/// したものを使うので、過去の Median Time Past を枝から引く経路も通る。
+pub fn relative_locktime_starts_at_its_height<S: ChainStore>(before: S, at: S) {
+    let mut before = open(before);
+    let mut at = open(at);
+
+    // 高さ 1 のコインベースを、鍵を握っている出力にする。
+    let key = SecretKey::generate();
+    let coin_lock = Lock::pay_to_pubkey(&key.public_key());
+    let genesis_hash = before.tip().unwrap().hash;
+    let mut first = build_on(&before, genesis_hash, 1);
+    first.transactions[0].outputs[0].lock = coin_lock.clone();
+    first.header.merkle_root = merkle::merkle_root(&[first.transactions[0].txid()]).unwrap();
+    let coin = OutPoint::new(first.transactions[0].txid(), 0);
+    let coin_output = first.transactions[0].outputs[0].clone();
+
+    let mut blocks = vec![first];
+    // 成熟するまで積む。使うブロックは高さ 1 + COINBASE_MATURITY。
+    let spend_height = 1 + oag_consensus::params::COINBASE_MATURITY;
+    for chain in [&mut before, &mut at] {
+        chain
+            .accept_block(blocks[0].clone(), &AcceptAnyPow, NOW)
+            .unwrap();
+    }
+    while before.height().unwrap() + 1 < spend_height {
+        let tip = before.tip().unwrap().hash;
+        let block = build_on(&before, tip, before.height().unwrap() + 10);
+        for chain in [&mut before, &mut at] {
+            chain
+                .accept_block(block.clone(), &AcceptAnyPow, NOW)
+                .unwrap();
+        }
+        blocks.push(block);
+    }
+
+    // 最大の時間 (65,535 × 512 秒、約 388 日) を待つ版数 2 の支払い。
+    // ブロックは 60 秒間隔なので、まったく足りない。
+    let mut spend = Transaction {
+        version: 2,
+        inputs: vec![TxInput::new(coin)],
+        outputs: vec![TxOutput::new(
+            coin_output
+                .amount
+                .checked_sub("0.01".parse().unwrap())
+                .unwrap(),
+            coin_lock,
+        )],
+        locktime: 0,
+    };
+    spend.inputs[0].sequence = SEQUENCE_TYPE_FLAG | 0xFFFF;
+    let msg = sighash(
+        &spend,
+        std::slice::from_ref(&coin_output),
+        0,
+        SighashType::DEFAULT,
+    )
+    .unwrap();
+    spend.inputs[0].signature = key.sign(&msg).to_bytes().to_vec();
+
+    let tip = before.tip().unwrap().hash;
+    let mut block = build_on(&before, tip, 999);
+    block.transactions.push(spend);
+    let txids: Vec<Hash> = block.transactions.iter().map(|t| t.txid()).collect();
+    block.header.merkle_root = merkle::merkle_root(&txids).unwrap();
+    assert_eq!(block.header.height, spend_height);
+    let hash = block.header.hash();
+
+    // 開始が 1 つ上なら、まだ強制されない。
+    before.set_relative_locktime_height(spend_height + 1);
+    assert_eq!(
+        before
+            .accept_block(block.clone(), &AcceptAnyPow, NOW)
+            .unwrap(),
+        AcceptOutcome::ExtendedTip
+    );
+    assert_eq!(before.tip().unwrap().hash, hash);
+
+    // 開始がこの高さなら弾かれ、先端は動かない。
+    at.set_relative_locktime_height(spend_height);
+    let _ = at.accept_block(block, &AcceptAnyPow, NOW);
+    assert_eq!(at.height().unwrap(), spend_height - 1);
+    assert_eq!(entry_of(&at, &hash).status, BlockStatus::Invalid);
 }

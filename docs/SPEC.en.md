@@ -669,14 +669,85 @@ as a time:    median time past ≥ locktime
 The semantics follow BIP68.
 
 ```
-bit 31 = 1  → relative locktime disabled
-bit 31 = 0  → relative locktime enabled
+tx.version < 2  → no relative locktime (whatever the sequence says)
+bit 31 = 1      → relative locktime disabled
+bit 31 = 0      → relative locktime enabled
     bit 22 = 0  → bits 0-15 interpreted as a block count
     bit 22 = 1  → bits 0-15 interpreted as units of 512 seconds
+other bits      → no meaning (left free for the future)
 ```
 
-In v1 relative locktime is **not enforced**, but the semantics of the field are
-fixed here so that enforcement can be turned on by a later soft fork.
+Counting starts at **the block that contains the referenced output**. As in
+§7.4, the conditions are written without an off-by-one.
+
+```
+blocks:  block height     ≥ output height + value
+time:    median time past ≥ MTP(output height) + value × 512
+```
+
+`MTP(h)` is the median time past the block at height `h` was validated
+against, i.e. the median of the timestamps of the last 11 blocks up to
+height `h − 1`. Height 0 has no parent, so it has no lower bound. The median
+time past on the left is the one of the block being validated, as in §7.4.
+
+This gives the same result as BIP68. BIP68 writes "minimum − 1 < current",
+which for integers is the same as "minimum ≤ current". A value of 0 is always
+satisfied. An output created by an earlier transaction in the same block counts
+as born at that block's height, so it can be spent in the same block with a
+value of 0 and not with 1 or more.
+
+#### Enforcement applies only to version 2 and above
+
+Version 1 transactions were made while `sequence` had no meaning. **They MUST
+NOT be invalidated by giving it a meaning afterwards.** This is the same line
+BIP68 draws. The standard wallet builds version 1 transactions with
+`sequence = 0xFFFFFFFF`, so enforcement does not affect it.
+
+#### Start of enforcement (soft fork)
+
+v1 did not enforce relative locktime. Enforcement MUST start with **blocks at
+or above the following heights**. Blocks below them MUST be validated without
+it.
+
+| Network | Height where enforcement starts |
+| --- | ---: |
+| mainnet | 40,000 |
+| testnet | 0 |
+| regtest | 0 |
+
+**This is a soft fork.** It only tightens the rules, so blocks made by
+upgraded nodes remain valid for nodes that have not upgraded. Conversely, a
+miner that has not upgraded can produce a block containing a transaction that
+fails the condition, and upgraded nodes will discard that block. Most miners
+need to have upgraded by the starting height.
+
+The mainnet height was placed about two weeks after the release that adds
+enforcement (about 1,450 blocks per day at height 21,190). testnet and regtest
+enforce from the start. Both were started before any tool could produce a
+version 2 transaction, so no past block becomes invalid.
+
+#### The mempool checks it regardless of height
+
+Nodes SHOULD NOT admit to the mempool a transaction whose relative locktime is
+not satisfied, even below the starting height. Before the start this is
+policy; after it, consensus. That way a node never builds a block from what it
+was holding at the moment enforcement starts and then rejects it itself.
+
+Outputs in the mempool count as born at the height of the next block. A child
+that waits 1 or more on an unconfirmed parent is therefore not admitted.
+
+#### What it is for
+
+Relative locktime expresses "a fixed period after this output is confirmed"
+with a pre-signed transaction. Not needing to know when the output will be
+confirmed at signing time is what sets it apart from absolute locktime.
+
+- Bidirectional payment channels (it gives the counterparty time to react when
+  a revoked old state is published; on this chain, which has no scripts, they
+  are built together with adaptor signatures)
+- Refunds in atomic swaps ([§17.2](#172-atomic-swaps-with-adaptor-signatures))
+- Inheritance and vault schemes that move funds to another key after a period
+  of inactivity
 
 **`sequence` MUST NOT be used to signal replaceability.** That is the usage in
 BIP125 rule 1, and this chain does not adopt it
@@ -940,6 +1011,9 @@ A block MUST satisfy all of the following.
    [BIP340](#53-signatures-schnorr-bip340) verification
 9. The `locktime` condition is satisfied
 10. No UTXO is spent twice within the same transaction
+11. In blocks at or above the height where enforcement starts, the relative
+    locktime condition of every input is satisfied
+    ([§7.5](#75-sequence-relative-locktime))
 
 ### 10.4 Handling unknown versions
 
@@ -3213,6 +3287,7 @@ The main choices and the reasons for them.
 | Mnemonic | BIP39, 12 words (128 bits) | 128 bits matches secp256k1's real strength of 2^128. A longer seed is not stronger than the curve and only adds transcription errors ([§6.6](#66-hd-wallets)) |
 | Key derivation | BIP32 / BIP44 | avoids a state where a phrase written in the standard vocabulary is interpreted into different keys by another wallet. Keeps the path to hardware wallets open |
 | mainnet coin type | put the applied-for 1033 in the implementation, and hold the mainnet launch until registration completes | fixing the path early lets wallet testing proceed. Before funds are involved, a number change costs only the path |
+| Relative locktime | start enforcing with a soft fork at a fixed height, for version 2 and above | the semantics were already fixed in v1, so only enforcement needs adding. Version 1 is excluded because `sequence` had no meaning when those transactions were made (as in BIP68). Signalling (version bits) is not used because there are few miners and they can be reached directly ([§7.5](#75-sequence-relative-locktime)) |
 | Unknown output versions | keep anyone-can-spend, restrict versions to 0–31 | rejecting makes every version addition a hard fork. Restricting the range shrinks the dangerous surface without reducing soft-fork headroom ([§10.4](#104-handling-unknown-versions)) |
 | Merged mining | disabled in v1 | do not debug the standalone chain and the Monero integration at the same time. Only header space is reserved |
 | Partially signed transactions | the same division of roles as PSBT (BIP174); carry the spent outputs alongside | because the sighash includes every input's amount and spending condition, a key-holding machine cannot sign from a raw transaction alone ([§16.8](#168-partially-signed-transactions-pst)) |
@@ -3242,6 +3317,8 @@ The main choices and the reasons for them.
 | A transaction index on by default | every node would pay 37 GB a year when blocks are full. Consensus requires only the UTXO set, and a wallet need only record the transactions relevant to itself. Operators who need it enable `--index` |
 | A maximum reorg depth | a network split deeper than the cap never rejoins. Leaving the attack possible is better than creating the possibility of a permanent split |
 | Extending coinbase maturity | pushing back a reorg takes cumulative work, not time, and in block count 120 is already deeper than Bitcoin's 100. Extending it changes only how long you wait for the reward, not the cost of a reorg |
+| An output version for "a key that cannot spend until a height" (CLTV equivalent) | It cannot be used to freeze other people's funds, but it adds things to handle: paying with a locked output to fake a payment, theft from the version before activation, and timestamp manipulation if unlocking by time. Many uses are covered by relative locktime plus pre-signed transactions |
+| SIGHASH_ANYPREVOUT (BIP118) | Running eltoo safely needs an enforced ordering so an old state cannot override a newer one, and that needs a CLTV-equivalent check. Combined with a known key it also yields covenants (constraints on how an output may be spent), which conflicts with the policy of having no scripts |
 | Requiring a rate increase for replacement | BIP125 rules 3 and 4 look only at totals, so a large low-rate transaction can evict a small high-rate one. Adding a rule of our own here makes mempool contents diverge between nodes, which feeds directly into compact-block hit rates. The weakness is accepted in favour of compatibility |
 
 ---
@@ -3632,6 +3709,8 @@ MAX_TX_SIZE                 100,000 bytes
 COINBASE_MATURITY           120 blocks
 MEDIAN_TIME_SPAN            11 blocks
 MAX_FUTURE_TIME_DRIFT       300 seconds
+Relative locktime enforced  mainnet 40,000 / testnet 0 / regtest 0
+  from height               (version 2+ transactions. SPEC §7.5)
 LWMA_WINDOW (N)             90            (provisional)
 MAX_TARGET                  2^256 − 1
 

@@ -81,3 +81,6 @@ scenario!(a_header_for_an_invalid_block_is_refused);
 // 難易度調整の有無
 scenario!(the_difficulty_never_moves_without_retargeting);
 scenario!(the_difficulty_rises_when_blocks_come_too_fast);
+
+// 相対 locktime の強制開始
+scenario!(relative_locktime_starts_at_its_height, two);

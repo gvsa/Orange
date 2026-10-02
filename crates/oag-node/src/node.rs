@@ -19,8 +19,8 @@ use oag_chain::chain::{AcceptOutcome, Chain, ChainError, HeaderOutcome, Reorg, R
 use oag_consensus::lock::Lock;
 use oag_consensus::params;
 use oag_consensus::validate::PowVerifier;
-use oag_consensus::{Block, BlockHeader};
-use oag_mempool::Mempool;
+use oag_consensus::{Block, BlockHeader, Transaction};
+use oag_mempool::{Mempool, Reject};
 use oag_miner::{build_template, BlockTemplate, TemplateError, TemplateRequest};
 use oag_pow::randomx::{RandomXPowError, RandomXVerifier};
 use oag_pow::seed_height;
@@ -248,6 +248,7 @@ impl Node {
         };
         let mut chain = Chain::open(store, genesis, network.genesis_difficulty(), retarget)?;
         chain.set_assume_valid(options.assume_valid.resolve(network));
+        chain.set_relative_locktime_height(network.relative_locktime_height());
 
         // 0.1.1 までは、初期同期でシードのエポックをまたぐと、正しいブロックに
         // 無効の印が付くことがあった (`Chain::reconsider_invalid`)。印は
@@ -299,6 +300,25 @@ impl Node {
     /// mempool (書き換え可能)。
     pub fn mempool_mut(&mut self) -> &mut Mempool {
         &mut self.mempool
+    }
+
+    /// トランザクションを mempool に入れる。
+    ///
+    /// 検証の文脈 (次の高さ、Median Time Past、過去の時刻を引く口) は
+    /// 現在の先端から作る。外側の `Err` はチェーンが読めなかったこと、
+    /// 内側の `Err` は mempool が断った理由である。
+    pub fn submit_transaction(
+        &mut self,
+        tx: Transaction,
+    ) -> Result<Result<Hash, Reject>, NodeError> {
+        let tip = self.chain.tip()?;
+        let next_height = tip.height() + 1;
+        let median_time_past = self.chain.median_time_past_for_child_of(&tip.hash)?;
+        let view = self.chain.utxo_view()?;
+        let times = self.chain.times_on(tip.hash);
+        Ok(self
+            .mempool
+            .accept(tx, &view, next_height, median_time_past, &times))
     }
 
     /// 現在の様子。
@@ -433,8 +453,9 @@ impl Node {
         let next_height = tip.height() + 1;
         let median_time_past = self.chain.median_time_past_for_child_of(&tip.hash)?;
         let view = self.chain.utxo_view()?;
+        let times = self.chain.times_on(tip.hash);
         self.mempool
-            .rebuild_after_reorg(orphaned, &view, next_height, median_time_past);
+            .rebuild_after_reorg(orphaned, &view, next_height, median_time_past, &times);
         Ok(())
     }
 

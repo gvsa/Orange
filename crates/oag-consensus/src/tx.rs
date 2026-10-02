@@ -76,6 +76,37 @@ pub struct TxInput {
 /// 相対 locktime を無効にする `sequence` 値。
 pub const SEQUENCE_FINAL: u32 = 0xFFFF_FFFF;
 
+/// `sequence` のこのビットが立っていれば、相対 locktime は無い (SPEC §7.5)。
+pub const SEQUENCE_DISABLE_FLAG: u32 = 1 << 31;
+
+/// `sequence` のこのビットが立っていれば、値を 512 秒単位の時間として読む。
+/// 立っていなければブロック数として読む (SPEC §7.5)。
+pub const SEQUENCE_TYPE_FLAG: u32 = 1 << 22;
+
+/// `sequence` のうち、相対 locktime の値を表す下位 16 ビット。
+pub const SEQUENCE_VALUE_MASK: u32 = 0x0000_FFFF;
+
+/// 時間で指定した相対 locktime の 1 単位の秒数。
+pub const SEQUENCE_GRANULARITY_SECS: i64 = 512;
+
+/// 相対 locktime が意味を持つ最小のトランザクション版数 (SPEC §7.5)。
+///
+/// これより古い版数では、`sequence` の値に関わらず相対 locktime は無い。
+/// BIP68 と同じ線引きである。版数 1 のトランザクションは `sequence` を
+/// 好きに使ってよかった時期に作られたものなので、後から意味を与えて
+/// 無効にしてはならない。
+pub const RELATIVE_LOCKTIME_MIN_TX_VERSION: u32 = 2;
+
+/// 1 入力ぶんの相対 locktime (SPEC §7.5)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RelativeLocktime {
+    /// 参照先の出力が入ったブロックから、このブロック数が経つまで使えない。
+    Blocks(u16),
+    /// 参照先の出力が入ったブロックの Median Time Past から、この秒数が
+    /// 経つまで使えない。値は必ず [`SEQUENCE_GRANULARITY_SECS`] の倍数。
+    Seconds(i64),
+}
+
 impl TxInput {
     /// 署名なしの入力を作る。署名は後から埋める。
     pub fn new(prev_out: OutPoint) -> TxInput {
@@ -86,9 +117,12 @@ impl TxInput {
         }
     }
 
-    /// 相対 locktime が有効か (SPEC §7.5)。
+    /// `sequence` の無効化ビットが立っていないか (SPEC §7.5)。
+    ///
+    /// **これだけでは相対 locktime があるとは言えない。** トランザクションの
+    /// 版数も要る。判定は [`Transaction::relative_locktime`] で行うこと。
     pub fn has_relative_locktime(&self) -> bool {
-        self.sequence & 0x8000_0000 == 0
+        self.sequence & SEQUENCE_DISABLE_FLAG == 0
     }
 }
 
@@ -195,6 +229,31 @@ impl Transaction {
     /// `locktime` がブロック高さを表すか (偽なら Unix 秒)。
     pub fn locktime_is_height(&self) -> bool {
         self.locktime < LOCKTIME_THRESHOLD
+    }
+
+    /// `input_index` 番目の入力の相対 locktime (SPEC §7.5)。
+    ///
+    /// 版数が [`RELATIVE_LOCKTIME_MIN_TX_VERSION`] より古いか、無効化
+    /// ビットが立っていれば `None`。値の 16 ビットより上で、種別ビット以外の
+    /// ビットは意味を持たず、無視する (BIP68 と同じく将来のために空けておく)。
+    ///
+    /// 入力番号が範囲外なら `None`。
+    pub fn relative_locktime(&self, input_index: usize) -> Option<RelativeLocktime> {
+        if self.version < RELATIVE_LOCKTIME_MIN_TX_VERSION {
+            return None;
+        }
+        let input = self.inputs.get(input_index)?;
+        if !input.has_relative_locktime() {
+            return None;
+        }
+        let value = (input.sequence & SEQUENCE_VALUE_MASK) as u16;
+        if input.sequence & SEQUENCE_TYPE_FLAG != 0 {
+            Some(RelativeLocktime::Seconds(
+                i64::from(value) * SEQUENCE_GRANULARITY_SECS,
+            ))
+        } else {
+            Some(RelativeLocktime::Blocks(value))
+        }
     }
 
     /// 出力金額の合計。総発行量を超える場合は `None`。
@@ -543,6 +602,63 @@ mod tests {
         );
         input.sequence = 10;
         assert!(input.has_relative_locktime());
+    }
+
+    #[test]
+    fn relative_locktime_needs_version_two() {
+        let mut tx = standard_tx();
+        tx.inputs[0].sequence = 10;
+
+        // 版数 1 では、無効化ビットが落ちていても相対 locktime は無い。
+        tx.version = 1;
+        assert_eq!(tx.relative_locktime(0), None);
+
+        tx.version = RELATIVE_LOCKTIME_MIN_TX_VERSION;
+        assert_eq!(tx.relative_locktime(0), Some(RelativeLocktime::Blocks(10)));
+        tx.version = u32::MAX;
+        assert_eq!(tx.relative_locktime(0), Some(RelativeLocktime::Blocks(10)));
+
+        // 範囲外の入力。
+        assert_eq!(tx.relative_locktime(1), None);
+    }
+
+    #[test]
+    fn relative_locktime_decoding() {
+        let mut tx = standard_tx();
+        tx.version = RELATIVE_LOCKTIME_MIN_TX_VERSION;
+
+        tx.inputs[0].sequence = SEQUENCE_FINAL;
+        assert_eq!(tx.relative_locktime(0), None);
+        tx.inputs[0].sequence = SEQUENCE_DISABLE_FLAG | 10;
+        assert_eq!(tx.relative_locktime(0), None);
+
+        tx.inputs[0].sequence = 0;
+        assert_eq!(tx.relative_locktime(0), Some(RelativeLocktime::Blocks(0)));
+        tx.inputs[0].sequence = 0xFFFF;
+        assert_eq!(
+            tx.relative_locktime(0),
+            Some(RelativeLocktime::Blocks(u16::MAX))
+        );
+
+        tx.inputs[0].sequence = SEQUENCE_TYPE_FLAG | 3;
+        assert_eq!(
+            tx.relative_locktime(0),
+            Some(RelativeLocktime::Seconds(3 * 512))
+        );
+        tx.inputs[0].sequence = SEQUENCE_TYPE_FLAG | 0xFFFF;
+        assert_eq!(
+            tx.relative_locktime(0),
+            Some(RelativeLocktime::Seconds(65_535 * 512))
+        );
+
+        // 値と種別以外のビットは無視する。
+        tx.inputs[0].sequence = (1 << 16) | (1 << 30) | 7;
+        assert_eq!(tx.relative_locktime(0), Some(RelativeLocktime::Blocks(7)));
+        tx.inputs[0].sequence = (1 << 23) | SEQUENCE_TYPE_FLAG | 7;
+        assert_eq!(
+            tx.relative_locktime(0),
+            Some(RelativeLocktime::Seconds(7 * 512))
+        );
     }
 
     #[test]

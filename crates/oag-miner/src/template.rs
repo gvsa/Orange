@@ -183,9 +183,9 @@ mod tests {
     use super::*;
     use oag_consensus::sighash::{sighash, SighashType};
     use oag_consensus::tx::{TxInput as Input, MAX_INPUT_SIGNATURE_LEN};
-    use oag_consensus::utxo::{UtxoEntry, UtxoSet};
+    use oag_consensus::utxo::{UtxoEntry, UtxoError, UtxoSet};
     use oag_consensus::validate::{
-        validate_block, AcceptAnyPow, BlockContext, HeaderContext, SignatureChecks,
+        validate_block, AcceptAnyPow, BlockContext, ChainTimes, HeaderContext, SignatureChecks,
     };
     use oag_primitives::{hash, Network, SecretKey};
 
@@ -193,6 +193,17 @@ mod tests {
     const MTP: i64 = 1_800_000_000;
     const NOW: i64 = MTP + 3_600;
     const DIFFICULTY: u64 = 1_000;
+
+    /// どの高さにも同じ Median Time Past を答える。
+    struct FixedTimes;
+
+    impl ChainTimes for FixedTimes {
+        fn median_time_past_at(&self, _height: u64) -> Result<i64, UtxoError> {
+            Ok(MTP - 1_000_000)
+        }
+    }
+
+    const TIMES: FixedTimes = FixedTimes;
 
     fn lock() -> Lock {
         Lock::pay_to_pubkey(&SecretKey::generate().public_key())
@@ -274,7 +285,7 @@ mod tests {
             let funds = fund(&mut utxo, "10", &[i]);
             let fee = format!("0.0{}", i + 1);
             mempool
-                .accept(spend(&funds, &fee), &utxo, HEIGHT, MTP)
+                .accept(spend(&funds, &fee), &utxo, HEIGHT, MTP, &TIMES)
                 .unwrap();
             expected = expected.checked_add(fee.parse().unwrap()).unwrap();
         }
@@ -298,7 +309,7 @@ mod tests {
         for i in 0..4u8 {
             let funds = fund(&mut utxo, "10", &[i, 0xaa]);
             mempool
-                .accept(spend(&funds, "0.05"), &utxo, HEIGHT, MTP)
+                .accept(spend(&funds, "0.05"), &utxo, HEIGHT, MTP, &TIMES)
                 .unwrap();
         }
 
@@ -315,6 +326,7 @@ mod tests {
                 now: NOW,
             },
             utxo: &utxo,
+            relative_locktime: Some(&TIMES),
         };
         let summary = validate_block(&block, &ctx, &AcceptAnyPow)
             .expect("the assembled block does not pass validation");
@@ -375,7 +387,7 @@ mod tests {
         for i in 0..1_600u32 {
             let funds = fund(&mut utxo, "10", &i.to_le_bytes());
             mempool
-                .accept(spend(&funds, "0.01"), &utxo, HEIGHT, MTP)
+                .accept(spend(&funds, "0.01"), &utxo, HEIGHT, MTP, &TIMES)
                 .unwrap();
         }
         assert_eq!(mempool.len(), 1_600, "the test's premise no longer holds");

@@ -19,7 +19,7 @@ use crate::policy::Policy;
 use oag_consensus::params;
 use oag_consensus::tx::OutPoint;
 use oag_consensus::utxo::{UtxoEntry, UtxoError, UtxoView};
-use oag_consensus::validate::{validate_transaction, SignatureChecks, ValidationError};
+use oag_consensus::validate::{validate_transaction, ChainTimes, SignatureChecks, ValidationError};
 use oag_consensus::{Block, Transaction, TxOutput};
 use oag_primitives::{Amount, Hash};
 use std::collections::{HashMap, HashSet};
@@ -408,8 +408,9 @@ impl Mempool {
         chain_utxo: &dyn UtxoView,
         next_height: u64,
         median_time_past: i64,
+        times: &dyn ChainTimes,
     ) -> Result<Hash, Reject> {
-        self.accept_with_replacements(tx, chain_utxo, next_height, median_time_past)
+        self.accept_with_replacements(tx, chain_utxo, next_height, median_time_past, times)
             .map(|accepted| accepted.txid)
     }
 
@@ -417,7 +418,15 @@ impl Mempool {
     ///
     /// `chain_utxo` は確定済みチェーンの UTXO、`next_height` はこの
     /// トランザクションが入りうる最初のブロックの高さ、`median_time_past` は
-    /// 現在の先端のものを渡す。
+    /// 現在の先端のものを渡す。`times` は現在の先端の枝で過去の Median Time
+    /// Past を答えるもの。
+    ///
+    /// # 相対 locktime は高さに関わらず確かめる
+    ///
+    /// コンセンサスで強制が始まる高さ (`docs/SPEC.md` §7.5) より前でも、
+    /// mempool は満たさないものを受け入れない。強制が始まった瞬間に、
+    /// 抱えていたものでブロックを作って自分で弾かれることが起きない。
+    /// 強制の前は、これはポリシーである。
     ///
     /// # 手数料を上げた置き換え (RBF)
     ///
@@ -444,6 +453,7 @@ impl Mempool {
         chain_utxo: &dyn UtxoView,
         next_height: u64,
         median_time_past: i64,
+        times: &dyn ChainTimes,
     ) -> Result<Accepted, Reject> {
         let txid = tx.txid();
         if self.entries.contains_key(&txid) {
@@ -494,6 +504,7 @@ impl Mempool {
             median_time_past,
             0,
             SignatureChecks::Verify,
+            Some(times),
         )?;
 
         // ── 以降はポリシーの判断 ──
@@ -683,6 +694,7 @@ impl Mempool {
         chain_utxo: &dyn UtxoView,
         next_height: u64,
         median_time_past: i64,
+        times: &dyn ChainTimes,
     ) -> Rebuilt {
         // 取り消された枝のものを先に置く。いちど確認まで進んでいた側であり、
         // 同じ UTXO を奪い合ったときはこちらを優先する。
@@ -700,7 +712,7 @@ impl Mempool {
 
         let mut report = Rebuilt::default();
         for (from_branch, tx) in dependency_order(candidates) {
-            match self.accept(tx, chain_utxo, next_height, median_time_past) {
+            match self.accept(tx, chain_utxo, next_height, median_time_past, times) {
                 Ok(_) if from_branch => report.resubmitted += 1,
                 Ok(_) => report.retained += 1,
                 Err(_) => report.dropped += 1,
@@ -820,13 +832,25 @@ mod tests {
     use super::*;
     use oag_consensus::lock::Lock;
     use oag_consensus::sighash::{sighash, SighashType};
-    use oag_consensus::tx::{TxInput, CURRENT_TX_VERSION};
+    use oag_consensus::tx::{TxInput, CURRENT_TX_VERSION, SEQUENCE_FINAL, SEQUENCE_TYPE_FLAG};
     use oag_consensus::utxo::UtxoSet;
     use oag_consensus::BlockHeader;
     use oag_primitives::{hash, merkle, SecretKey};
 
     const HEIGHT: u64 = 500;
     const MTP: i64 = 1_800_000_000;
+
+    /// どの高さにも同じ Median Time Past を答える。
+    struct FixedTimes(i64);
+
+    impl ChainTimes for FixedTimes {
+        fn median_time_past_at(&self, _height: u64) -> Result<i64, UtxoError> {
+            Ok(self.0)
+        }
+    }
+
+    /// 資金はいずれも十分に古い。
+    const TIMES: FixedTimes = FixedTimes(MTP - 1_000_000);
 
     /// 使える資金 1 件。
     struct Funds {
@@ -903,7 +927,7 @@ mod tests {
     fn accepts_a_valid_transaction() {
         let (mut pool, utxo, funds) = setup();
         let tx = simple_spend(&funds, "0.01");
-        let txid = pool.accept(tx.clone(), &utxo, HEIGHT, MTP).unwrap();
+        let txid = pool.accept(tx.clone(), &utxo, HEIGHT, MTP, &TIMES).unwrap();
 
         assert_eq!(txid, tx.txid());
         assert_eq!(pool.len(), 1);
@@ -916,9 +940,9 @@ mod tests {
     fn rejects_a_duplicate() {
         let (mut pool, utxo, funds) = setup();
         let tx = simple_spend(&funds, "0.01");
-        pool.accept(tx.clone(), &utxo, HEIGHT, MTP).unwrap();
+        pool.accept(tx.clone(), &utxo, HEIGHT, MTP, &TIMES).unwrap();
         assert_eq!(
-            pool.accept(tx, &utxo, HEIGHT, MTP),
+            pool.accept(tx, &utxo, HEIGHT, MTP, &TIMES),
             Err(Reject::AlreadyKnown)
         );
         assert_eq!(pool.len(), 1);
@@ -934,7 +958,7 @@ mod tests {
             locktime: 0,
         };
         assert_eq!(
-            pool.accept(coinbase, &utxo, HEIGHT, MTP),
+            pool.accept(coinbase, &utxo, HEIGHT, MTP, &TIMES),
             Err(Reject::Coinbase)
         );
     }
@@ -946,7 +970,7 @@ mod tests {
         let mut tx = simple_spend(&funds, "0.01");
         tx.outputs[0].amount = Amount::from_oag(1).unwrap();
         assert!(matches!(
-            pool.accept(tx, &utxo, HEIGHT, MTP),
+            pool.accept(tx, &utxo, HEIGHT, MTP, &TIMES),
             Err(Reject::Consensus(ValidationError::BadSignature { .. }))
         ));
         assert!(pool.is_empty());
@@ -958,7 +982,7 @@ mod tests {
         let mut tx = simple_spend(&funds, "0.01");
         tx.inputs[0].prev_out = OutPoint::new(hash::txid(b"ghost"), 0);
         assert!(matches!(
-            pool.accept(tx, &utxo, HEIGHT, MTP),
+            pool.accept(tx, &utxo, HEIGHT, MTP, &TIMES),
             Err(Reject::Consensus(ValidationError::MissingUtxo))
         ));
     }
@@ -984,7 +1008,7 @@ mod tests {
         );
         assert_eq!(tx.size(), probe.size(), "the size has changed");
         assert_eq!(
-            pool.accept(tx, &utxo, HEIGHT, MTP),
+            pool.accept(tx, &utxo, HEIGHT, MTP, &TIMES),
             Err(Reject::FeeTooLow {
                 paid: short,
                 required
@@ -999,7 +1023,7 @@ mod tests {
                 to("1").lock,
             )],
         );
-        assert!(pool.accept(tx, &utxo, HEIGHT, MTP).is_ok());
+        assert!(pool.accept(tx, &utxo, HEIGHT, MTP, &TIMES).is_ok());
     }
 
     #[test]
@@ -1022,7 +1046,7 @@ mod tests {
             ],
         );
         assert_eq!(
-            pool.accept(tx, &utxo, HEIGHT, MTP),
+            pool.accept(tx, &utxo, HEIGHT, MTP, &TIMES),
             Err(Reject::DustOutput {
                 index: 1,
                 amount: dust,
@@ -1043,7 +1067,7 @@ mod tests {
             vec![TxOutput::new("9.99".parse().unwrap(), future_lock)],
         );
         assert_eq!(
-            pool.accept(tx, &utxo, HEIGHT, MTP),
+            pool.accept(tx, &utxo, HEIGHT, MTP, &TIMES),
             Err(Reject::UnknownLockVersionCreated {
                 index: 0,
                 version: 7
@@ -1077,7 +1101,7 @@ mod tests {
         };
         let mut pool = Mempool::new();
         assert_eq!(
-            pool.accept(tx, &utxo, HEIGHT, MTP),
+            pool.accept(tx, &utxo, HEIGHT, MTP, &TIMES),
             Err(Reject::UnknownLockVersionSpent {
                 index: 0,
                 version: 7
@@ -1101,7 +1125,128 @@ mod tests {
                 Lock::new(7, vec![0xab; 32]).unwrap(),
             )],
         );
-        assert!(pool.accept(tx, &utxo, HEIGHT, MTP).is_ok());
+        assert!(pool.accept(tx, &utxo, HEIGHT, MTP, &TIMES).is_ok());
+    }
+
+    // ━━━━━━━━ 相対 locktime (SPEC §7.5) ━━━━━━━━
+
+    /// 資金 1 件を版数 2・指定の `sequence` で使う。手数料は 0.01。
+    fn relative_spend(funds: &Funds, sequence: u32) -> Transaction {
+        let out = funds
+            .output
+            .amount
+            .checked_sub("0.01".parse().unwrap())
+            .unwrap();
+        let mut tx = Transaction {
+            version: 2,
+            inputs: vec![TxInput::new(funds.outpoint)],
+            outputs: vec![TxOutput::new(
+                out,
+                Lock::pay_to_pubkey(&funds.key.public_key()),
+            )],
+            locktime: 0,
+        };
+        tx.inputs[0].sequence = sequence;
+        let msg = sighash(
+            &tx,
+            std::slice::from_ref(&funds.output),
+            0,
+            SighashType::DEFAULT,
+        )
+        .unwrap();
+        tx.inputs[0].signature = funds.key.sign(&msg).to_bytes().to_vec();
+        tx
+    }
+
+    fn not_yet(result: Result<Hash, Reject>) -> bool {
+        matches!(
+            result,
+            Err(Reject::Consensus(
+                ValidationError::RelativeLocktimeNotSatisfied { .. }
+            ))
+        )
+    }
+
+    #[test]
+    fn a_relative_locktime_in_blocks_is_enforced() {
+        // 資金は高さ 1。HEIGHT (500) に入るには 499 ブロックまで。
+        let (mut pool, utxo, funds) = setup();
+        assert!(not_yet(pool.accept(
+            relative_spend(&funds, 500),
+            &utxo,
+            HEIGHT,
+            MTP,
+            &TIMES
+        )));
+        assert!(pool
+            .accept(relative_spend(&funds, 499), &utxo, HEIGHT, MTP, &TIMES)
+            .is_ok());
+    }
+
+    #[test]
+    fn a_relative_locktime_in_time_is_enforced() {
+        // 資金のブロックの MTP は MTP - 1000。1 単位 (512 秒) なら足り、
+        // 2 単位 (1024 秒) なら足りない。
+        let (mut pool, utxo, funds) = setup();
+        let times = FixedTimes(MTP - 1_000);
+        let by_time = |units: u32| relative_spend(&funds, SEQUENCE_TYPE_FLAG | units);
+        assert!(not_yet(pool.accept(by_time(2), &utxo, HEIGHT, MTP, &times)));
+        assert!(pool.accept(by_time(1), &utxo, HEIGHT, MTP, &times).is_ok());
+    }
+
+    #[test]
+    fn a_child_of_an_unconfirmed_parent_cannot_wait() {
+        // mempool の中の出力は、次のブロックで生まれる扱いである。
+        // 待ち時間 0 なら同じブロックに入れるが、1 でも待つなら入れない。
+        let (mut pool, utxo, funds) = setup();
+        let parent = relative_spend(&funds, SEQUENCE_FINAL);
+        pool.accept(parent.clone(), &utxo, HEIGHT, MTP, &TIMES)
+            .unwrap();
+        let child_funds = Funds {
+            outpoint: OutPoint::new(parent.txid(), 0),
+            output: parent.outputs[0].clone(),
+            key: funds.key.clone(),
+        };
+
+        assert!(not_yet(pool.accept(
+            relative_spend(&child_funds, 1),
+            &utxo,
+            HEIGHT,
+            MTP,
+            &TIMES
+        )));
+        assert!(pool
+            .accept(relative_spend(&child_funds, 0), &utxo, HEIGHT, MTP, &TIMES)
+            .is_ok());
+    }
+
+    #[test]
+    fn a_relative_locktime_that_comes_undone_after_a_reorg_is_dropped() {
+        let (mut pool, utxo, funds) = setup();
+        pool.accept(relative_spend(&funds, 499), &utxo, HEIGHT, MTP, &TIMES)
+            .unwrap();
+
+        // 先端が 1 つ戻ると、待ち時間が足りなくなる。
+        let report = pool.rebuild_after_reorg(Vec::new(), &utxo, HEIGHT - 1, MTP, &TIMES);
+        assert_eq!(report.dropped, 1);
+        assert!(pool.is_empty());
+    }
+
+    #[test]
+    fn version_one_is_not_held_back_by_its_sequence() {
+        // 版数 1 の sequence には意味が無い。
+        let (mut pool, utxo, funds) = setup();
+        let mut tx = simple_spend(&funds, "0.01");
+        tx.inputs[0].sequence = 60_000;
+        let msg = sighash(
+            &tx,
+            std::slice::from_ref(&funds.output),
+            0,
+            SighashType::DEFAULT,
+        )
+        .unwrap();
+        tx.inputs[0].signature = funds.key.sign(&msg).to_bytes().to_vec();
+        assert!(pool.accept(tx, &utxo, HEIGHT, MTP, &TIMES).is_ok());
     }
 
     // ━━━━━━━━ 競合と依存 ━━━━━━━━
@@ -1127,10 +1272,18 @@ mod tests {
                 Lock::pay_to_pubkey(&parent_key.public_key()),
             )],
         );
-        let parent_id = pool.accept(parent.clone(), utxo, HEIGHT, MTP).unwrap();
+        let parent_id = pool
+            .accept(parent.clone(), utxo, HEIGHT, MTP, &TIMES)
+            .unwrap();
         let child_funds = from_pool(parent_id, &parent, parent_key);
         let child_id = pool
-            .accept(simple_spend(&child_funds, "0.01"), utxo, HEIGHT, MTP)
+            .accept(
+                simple_spend(&child_funds, "0.01"),
+                utxo,
+                HEIGHT,
+                MTP,
+                &TIMES,
+            )
             .unwrap();
         (parent_id, child_id)
     }
@@ -1139,11 +1292,11 @@ mod tests {
     fn a_higher_fee_replaces_the_original() {
         let (mut pool, utxo, funds) = setup();
         let first_id = pool
-            .accept(simple_spend(&funds, "0.01"), &utxo, HEIGHT, MTP)
+            .accept(simple_spend(&funds, "0.01"), &utxo, HEIGHT, MTP, &TIMES)
             .unwrap();
 
         let accepted = pool
-            .accept_with_replacements(simple_spend(&funds, "0.02"), &utxo, HEIGHT, MTP)
+            .accept_with_replacements(simple_spend(&funds, "0.02"), &utxo, HEIGHT, MTP, &TIMES)
             .unwrap();
 
         assert_eq!(accepted.replaced, vec![first_id]);
@@ -1156,11 +1309,11 @@ mod tests {
     fn a_replacement_that_pays_less_is_refused() {
         let (mut pool, utxo, funds) = setup();
         let first_id = pool
-            .accept(simple_spend(&funds, "0.02"), &utxo, HEIGHT, MTP)
+            .accept(simple_spend(&funds, "0.02"), &utxo, HEIGHT, MTP, &TIMES)
             .unwrap();
 
         let err = pool
-            .accept(simple_spend(&funds, "0.01"), &utxo, HEIGHT, MTP)
+            .accept(simple_spend(&funds, "0.01"), &utxo, HEIGHT, MTP, &TIMES)
             .unwrap_err();
         assert!(
             matches!(err, Reject::ReplacementPaysLess { count: 1, .. }),
@@ -1173,14 +1326,20 @@ mod tests {
     #[test]
     fn a_replacement_must_pay_for_its_own_bandwidth() {
         let (mut pool, utxo, funds) = setup();
-        pool.accept(simple_spend(&funds, "0.01"), &utxo, HEIGHT, MTP)
+        pool.accept(simple_spend(&funds, "0.01"), &utxo, HEIGHT, MTP, &TIMES)
             .unwrap();
 
         // 手数料は上がっているが、上乗せが自分のサイズ分に足りない。
         // これを許すと、1 atomic ずつ上げるだけで同じ資金を何度でも
         // 中継させられる。
         let err = pool
-            .accept(simple_spend(&funds, "0.0100001"), &utxo, HEIGHT, MTP)
+            .accept(
+                simple_spend(&funds, "0.0100001"),
+                &utxo,
+                HEIGHT,
+                MTP,
+                &TIMES,
+            )
             .unwrap_err();
         match err {
             Reject::ReplacementIncrementTooLow {
@@ -1207,7 +1366,7 @@ mod tests {
 
         // 親を置き換えると、親の出力を使っていた子も行き場を失う。
         let accepted = pool
-            .accept_with_replacements(simple_spend(&funds, "0.5"), &utxo, HEIGHT, MTP)
+            .accept_with_replacements(simple_spend(&funds, "0.5"), &utxo, HEIGHT, MTP, &TIMES)
             .unwrap();
 
         let mut expected = vec![parent_id, child_id];
@@ -1224,7 +1383,7 @@ mod tests {
         // 親の手数料 0.01 だけを上回っても足りない。子の 0.01 も含めた
         // 合計を超える必要がある。
         let err = pool
-            .accept(simple_spend(&funds, "0.015"), &utxo, HEIGHT, MTP)
+            .accept(simple_spend(&funds, "0.015"), &utxo, HEIGHT, MTP, &TIMES)
             .unwrap_err();
         assert!(
             matches!(err, Reject::ReplacementPaysLess { count: 2, .. }),
@@ -1239,7 +1398,7 @@ mod tests {
         let a = fund(&mut utxo, "10", b"a");
         let b = fund(&mut utxo, "10", b"b");
         let mut pool = Mempool::new();
-        pool.accept(simple_spend(&a, "0.01"), &utxo, HEIGHT, MTP)
+        pool.accept(simple_spend(&a, "0.01"), &utxo, HEIGHT, MTP, &TIMES)
             .unwrap();
 
         let other_key = SecretKey::generate();
@@ -1250,7 +1409,9 @@ mod tests {
                 Lock::pay_to_pubkey(&other_key.public_key()),
             )],
         );
-        let other_id = pool.accept(other.clone(), &utxo, HEIGHT, MTP).unwrap();
+        let other_id = pool
+            .accept(other.clone(), &utxo, HEIGHT, MTP, &TIMES)
+            .unwrap();
         let unconfirmed = from_pool(other_id, &other, other_key);
 
         // a を置き換えつつ、mempool にしかない出力を新たに使う。手数料は
@@ -1258,7 +1419,7 @@ mod tests {
         // 左右されることになる。
         let replacement = spend(&[&a, &unconfirmed], vec![to("19.5")]);
         assert_eq!(
-            pool.accept(replacement, &utxo, HEIGHT, MTP),
+            pool.accept(replacement, &utxo, HEIGHT, MTP, &TIMES),
             Err(Reject::ReplacementAddsUnconfirmedInput {
                 outpoint: unconfirmed.outpoint
             })
@@ -1277,7 +1438,7 @@ mod tests {
         parent_and_child(&mut pool, &utxo, &funds);
 
         assert_eq!(
-            pool.accept(simple_spend(&funds, "0.5"), &utxo, HEIGHT, MTP),
+            pool.accept(simple_spend(&funds, "0.5"), &utxo, HEIGHT, MTP, &TIMES),
             Err(Reject::TooManyReplacements { count: 2, max: 1 })
         );
         assert_eq!(pool.len(), 2);
@@ -1287,13 +1448,13 @@ mod tests {
     fn a_replacement_that_fails_validation_leaves_the_original_alone() {
         let (mut pool, utxo, funds) = setup();
         let first_id = pool
-            .accept(simple_spend(&funds, "0.01"), &utxo, HEIGHT, MTP)
+            .accept(simple_spend(&funds, "0.01"), &utxo, HEIGHT, MTP, &TIMES)
             .unwrap();
 
         // 手数料は申し分ないが、署名が通らない。
         let mut bad = simple_spend(&funds, "0.5");
         bad.inputs[0].signature = vec![0u8; 64];
-        assert!(pool.accept(bad, &utxo, HEIGHT, MTP).is_err());
+        assert!(pool.accept(bad, &utxo, HEIGHT, MTP, &TIMES).is_err());
 
         assert!(
             pool.contains(&first_id),
@@ -1313,7 +1474,9 @@ mod tests {
                 Lock::pay_to_pubkey(&parent_key.public_key()),
             )],
         );
-        let parent_id = pool.accept(parent.clone(), &utxo, HEIGHT, MTP).unwrap();
+        let parent_id = pool
+            .accept(parent.clone(), &utxo, HEIGHT, MTP, &TIMES)
+            .unwrap();
 
         let middle = Funds {
             outpoint: OutPoint::new(parent_id, 0),
@@ -1322,7 +1485,7 @@ mod tests {
         };
         let child = simple_spend(&middle, "0.01");
         assert!(
-            pool.accept(child, &utxo, HEIGHT, MTP).is_ok(),
+            pool.accept(child, &utxo, HEIGHT, MTP, &TIMES).is_ok(),
             "an output in the mempool cannot be spent"
         );
         assert_eq!(pool.len(), 2);
@@ -1339,14 +1502,16 @@ mod tests {
                 Lock::pay_to_pubkey(&parent_key.public_key()),
             )],
         );
-        let parent_id = pool.accept(parent.clone(), &utxo, HEIGHT, MTP).unwrap();
+        let parent_id = pool
+            .accept(parent.clone(), &utxo, HEIGHT, MTP, &TIMES)
+            .unwrap();
         let middle = Funds {
             outpoint: OutPoint::new(parent_id, 0),
             output: parent.outputs[0].clone(),
             key: parent_key,
         };
         let child = simple_spend(&middle, "0.01");
-        let child_id = pool.accept(child, &utxo, HEIGHT, MTP).unwrap();
+        let child_id = pool.accept(child, &utxo, HEIGHT, MTP, &TIMES).unwrap();
 
         let removed = pool.remove_recursive(&parent_id);
         assert_eq!(removed.len(), 2, "descendants should be removed too");
@@ -1364,10 +1529,10 @@ mod tests {
         let rich = fund(&mut utxo, "10", b"rich");
         let mut pool = Mempool::new();
 
-        pool.accept(simple_spend(&cheap, "0.01"), &utxo, HEIGHT, MTP)
+        pool.accept(simple_spend(&cheap, "0.01"), &utxo, HEIGHT, MTP, &TIMES)
             .unwrap();
         let rich_tx = simple_spend(&rich, "1");
-        let rich_id = pool.accept(rich_tx, &utxo, HEIGHT, MTP).unwrap();
+        let rich_id = pool.accept(rich_tx, &utxo, HEIGHT, MTP, &TIMES).unwrap();
 
         let selected = pool.select_for_block(params::MAX_BLOCK_SIZE);
         assert_eq!(selected.len(), 2);
@@ -1391,7 +1556,9 @@ mod tests {
                 Lock::pay_to_pubkey(&parent_key.public_key()),
             )],
         );
-        let parent_id = pool.accept(parent.clone(), &utxo, HEIGHT, MTP).unwrap();
+        let parent_id = pool
+            .accept(parent.clone(), &utxo, HEIGHT, MTP, &TIMES)
+            .unwrap();
 
         let middle = Funds {
             outpoint: OutPoint::new(parent_id, 0),
@@ -1400,7 +1567,7 @@ mod tests {
         };
         // 子の手数料をずっと高くする。
         let child = simple_spend(&middle, "5");
-        let child_id = pool.accept(child, &utxo, HEIGHT, MTP).unwrap();
+        let child_id = pool.accept(child, &utxo, HEIGHT, MTP, &TIMES).unwrap();
         assert!(pool.get(&child_id).unwrap().fee_rate() > pool.get(&parent_id).unwrap().fee_rate());
 
         let selected = pool.select_for_block(params::MAX_BLOCK_SIZE);
@@ -1422,7 +1589,7 @@ mod tests {
             let funds = fund(&mut utxo, "10", &[i]);
             let tx = simple_spend(&funds, "0.01");
             sizes.push(tx.size());
-            pool.accept(tx, &utxo, HEIGHT, MTP).unwrap();
+            pool.accept(tx, &utxo, HEIGHT, MTP, &TIMES).unwrap();
         }
         // 2 件分だけの領域を与える。
         let budget = sizes[0] * 2 + 10;
@@ -1444,13 +1611,15 @@ mod tests {
                 Lock::pay_to_pubkey(&parent_key.public_key()),
             )],
         );
-        let parent_id = pool.accept(parent.clone(), &utxo, HEIGHT, MTP).unwrap();
+        let parent_id = pool
+            .accept(parent.clone(), &utxo, HEIGHT, MTP, &TIMES)
+            .unwrap();
         let middle = Funds {
             outpoint: OutPoint::new(parent_id, 0),
             output: parent.outputs[0].clone(),
             key: parent_key,
         };
-        pool.accept(simple_spend(&middle, "0.01"), &utxo, HEIGHT, MTP)
+        pool.accept(simple_spend(&middle, "0.01"), &utxo, HEIGHT, MTP, &TIMES)
             .unwrap();
 
         let selected = pool.select_for_block(parent.size());
@@ -1480,7 +1649,7 @@ mod tests {
     fn a_connected_block_clears_the_transactions_it_contains() {
         let (mut pool, utxo, funds) = setup();
         let tx = simple_spend(&funds, "0.01");
-        pool.accept(tx.clone(), &utxo, HEIGHT, MTP).unwrap();
+        pool.accept(tx.clone(), &utxo, HEIGHT, MTP, &TIMES).unwrap();
         assert_eq!(pool.len(), 1);
 
         assert_eq!(pool.on_block_connected(&block_with(vec![tx])), 1);
@@ -1494,7 +1663,7 @@ mod tests {
         // 二重使用になるので取り除かれる。
         let (mut pool, utxo, funds) = setup();
         let mine = simple_spend(&funds, "0.01");
-        pool.accept(mine, &utxo, HEIGHT, MTP).unwrap();
+        pool.accept(mine, &utxo, HEIGHT, MTP, &TIMES).unwrap();
 
         let theirs = spend(&[&funds], vec![to("9.5")]);
         assert_eq!(pool.on_block_connected(&block_with(vec![theirs])), 1);
@@ -1507,7 +1676,7 @@ mod tests {
         let mine = fund(&mut utxo, "10", b"mine");
         let other = fund(&mut utxo, "10", b"other");
         let mut pool = Mempool::new();
-        pool.accept(simple_spend(&mine, "0.01"), &utxo, HEIGHT, MTP)
+        pool.accept(simple_spend(&mine, "0.01"), &utxo, HEIGHT, MTP, &TIMES)
             .unwrap();
 
         let unrelated = simple_spend(&other, "0.01");
@@ -1542,7 +1711,7 @@ mod tests {
         let payment = simple_spend(&funds, "0.01");
         let txid = payment.txid();
 
-        let report = pool.rebuild_after_reorg(vec![payment], &utxo, HEIGHT, MTP);
+        let report = pool.rebuild_after_reorg(vec![payment], &utxo, HEIGHT, MTP, &TIMES);
 
         assert_eq!(report.resubmitted, 1);
         assert_eq!(report.dropped, 0);
@@ -1558,7 +1727,7 @@ mod tests {
         // 新しい枝が使い切ったものとする。
         utxo.remove(&funds.outpoint).unwrap();
 
-        let report = pool.rebuild_after_reorg(vec![payment], &utxo, HEIGHT, MTP);
+        let report = pool.rebuild_after_reorg(vec![payment], &utxo, HEIGHT, MTP, &TIMES);
 
         assert_eq!(report.resubmitted, 0);
         assert_eq!(report.dropped, 1);
@@ -1571,12 +1740,12 @@ mod tests {
         // 残したまま掘ると、自分のブロックが自分で弾かれる。
         let (mut pool, mut utxo, funds) = setup();
         let stale = simple_spend(&funds, "0.01");
-        let stale_id = pool.accept(stale, &utxo, HEIGHT, MTP).unwrap();
+        let stale_id = pool.accept(stale, &utxo, HEIGHT, MTP, &TIMES).unwrap();
         assert!(pool.contains(&stale_id));
 
         // 新しい枝が同じ UTXO を別の形で使った。
         utxo.remove(&funds.outpoint).unwrap();
-        let report = pool.rebuild_after_reorg(Vec::new(), &utxo, HEIGHT, MTP);
+        let report = pool.rebuild_after_reorg(Vec::new(), &utxo, HEIGHT, MTP, &TIMES);
 
         assert_eq!(report.retained, 0);
         assert_eq!(report.dropped, 1);
@@ -1590,9 +1759,9 @@ mod tests {
     fn an_untouched_entry_survives_the_rebuild() {
         let (mut pool, utxo, funds) = setup();
         let payment = simple_spend(&funds, "0.01");
-        let txid = pool.accept(payment, &utxo, HEIGHT, MTP).unwrap();
+        let txid = pool.accept(payment, &utxo, HEIGHT, MTP, &TIMES).unwrap();
 
-        let report = pool.rebuild_after_reorg(Vec::new(), &utxo, HEIGHT, MTP);
+        let report = pool.rebuild_after_reorg(Vec::new(), &utxo, HEIGHT, MTP, &TIMES);
 
         assert_eq!(report.retained, 1);
         assert_eq!(report.dropped, 0);
@@ -1618,7 +1787,7 @@ mod tests {
         let child_id = child.txid();
 
         // わざと子を先に渡す。
-        let report = pool.rebuild_after_reorg(vec![child, parent], &utxo, HEIGHT, MTP);
+        let report = pool.rebuild_after_reorg(vec![child, parent], &utxo, HEIGHT, MTP, &TIMES);
 
         assert_eq!(
             report.resubmitted, 2,
@@ -1646,7 +1815,7 @@ mod tests {
         // 新しい枝が親の入力を使い切った。親は戻れない。
         utxo.remove(&funds.outpoint).unwrap();
 
-        let report = pool.rebuild_after_reorg(vec![parent, child], &utxo, HEIGHT, MTP);
+        let report = pool.rebuild_after_reorg(vec![parent, child], &utxo, HEIGHT, MTP, &TIMES);
 
         assert_eq!(report.resubmitted, 0);
         assert_eq!(report.dropped, 2);
@@ -1659,12 +1828,12 @@ mod tests {
         // いちど確認まで進んでいた側を先に置く。
         let (mut pool, utxo, funds) = setup();
         let in_pool = spend(&[&funds], vec![to("9.99")]);
-        let in_pool_id = pool.accept(in_pool, &utxo, HEIGHT, MTP).unwrap();
+        let in_pool_id = pool.accept(in_pool, &utxo, HEIGHT, MTP, &TIMES).unwrap();
         let confirmed = spend(&[&funds], vec![to("9.98")]);
         let confirmed_id = confirmed.txid();
         assert_ne!(in_pool_id, confirmed_id);
 
-        let report = pool.rebuild_after_reorg(vec![confirmed], &utxo, HEIGHT, MTP);
+        let report = pool.rebuild_after_reorg(vec![confirmed], &utxo, HEIGHT, MTP, &TIMES);
 
         assert_eq!(report.resubmitted, 1);
         assert!(pool.contains(&confirmed_id));
@@ -1688,12 +1857,12 @@ mod tests {
         });
 
         let cheap_id = pool
-            .accept(simple_spend(&cheap, "0.01"), &utxo, HEIGHT, MTP)
+            .accept(simple_spend(&cheap, "0.01"), &utxo, HEIGHT, MTP, &TIMES)
             .unwrap();
         assert_eq!(pool.len(), 1);
 
         let rich_id = pool
-            .accept(simple_spend(&rich, "1"), &utxo, HEIGHT, MTP)
+            .accept(simple_spend(&rich, "1"), &utxo, HEIGHT, MTP, &TIMES)
             .unwrap();
         assert_eq!(pool.len(), 1, "holding more than the limit");
         assert!(pool.contains(&rich_id), "the higher rate should remain");
@@ -1713,7 +1882,7 @@ mod tests {
         for i in 0..10u8 {
             let funds = fund(&mut utxo, "10", &[i, 0xff]);
             let fee = format!("0.{:02}", i + 1);
-            pool.accept(simple_spend(&funds, &fee), &utxo, HEIGHT, MTP)
+            pool.accept(simple_spend(&funds, &fee), &utxo, HEIGHT, MTP, &TIMES)
                 .unwrap();
         }
 

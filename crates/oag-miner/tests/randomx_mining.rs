@@ -74,6 +74,7 @@ fn a_block_mined_with_randomx_passes_validation() {
             now: NOW,
         },
         utxo: &utxo,
+        relative_locktime: None,
     };
     validate_block(&block, &ctx, &AcceptAnyPow)
         .expect("the assembled block does not pass validation");

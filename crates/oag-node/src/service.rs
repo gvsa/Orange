@@ -2065,18 +2065,10 @@ impl Service {
             self.tx_requests.received(&txid);
         }
 
-        let tip = self.node.chain().tip().map_err(|e| e.to_string())?;
-        let next_height = tip.height() + 1;
-        let mtp = self
-            .node
-            .chain()
-            .median_time_past_for_child_of(&tip.hash)
-            .map_err(|e| e.to_string())?;
-        let view = self.node.chain().utxo_view().map_err(|e| e.to_string())?;
         let accepted = self
             .node
-            .mempool_mut()
-            .accept(tx, &view, next_height, mtp)
+            .submit_transaction(tx)
+            .map_err(|e| e.to_string())?
             .map_err(|e| e.to_string())?;
 
         // **受け取ったことを出す。** 届いていないのか、届いたが断られた
