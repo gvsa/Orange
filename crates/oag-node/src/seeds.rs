@@ -32,7 +32,7 @@ use oag_primitives::Network;
 use std::net::SocketAddr;
 
 /// mainnet のシード。
-pub const MAINNET_SEEDS: &[&str] = &["seed.oagcoin.org"];
+pub const MAINNET_SEEDS: &[&str] = &["seed.oagcoin.org", "oagnode.vslabs.co.in"];
 
 /// testnet のシード。
 ///
