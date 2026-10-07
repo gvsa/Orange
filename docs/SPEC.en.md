@@ -2243,7 +2243,7 @@ set while skipping an unvalidated block.
 
 | Network | Hostname |
 | --- | --- |
-| mainnet | `seed.oagcoin.org` |
+| mainnet | `seed.oagcoin.org`, `oagnode.vslabs.co.in` |
 | testnet | `testnet-seed.oagcoin.org` |
 | regtest | none |
 

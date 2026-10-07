@@ -2154,7 +2154,7 @@ txid を「消えた」と知らせる手立ては無い。** 各ノードが自
 
 | ネットワーク | ホスト名 |
 | --- | --- |
-| mainnet | `seed.oagcoin.org` |
+| mainnet | `seed.oagcoin.org`、`oagnode.vslabs.co.in` |
 | testnet | `testnet-seed.oagcoin.org` |
 | regtest | なし |
 

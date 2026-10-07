@@ -249,9 +249,9 @@ keeps just the trouble in its own file.
 ### Connecting to the public network
 
 On mainnet and testnet, a node finds peers by itself unless you name them. It
-queries the DNS seed (`seed.oagcoin.org`) only when its address book is empty;
-after that, nodes tell each other about addresses. It keeps 8 outbound
-connections.
+queries the DNS seeds (on mainnet `seed.oagcoin.org` and
+`oagnode.vslabs.co.in`) only when its address book is empty; after that, nodes
+tell each other about addresses. It keeps 8 outbound connections.
 
 Behind a home router, the node asks the router (UPnP, or NAT-PMP) to forward
 the port and announces the router's outside address if that worked; pass

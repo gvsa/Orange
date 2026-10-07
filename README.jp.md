@@ -220,7 +220,8 @@ cargo build --release -p oag-node
 ### 公開ネットワークに繋ぐ
 
 mainnet と testnet では、繋ぎ先を指定しなければ自動で探します。住所帳が
-空のときだけ DNS シード (`seed.oagcoin.org`) を引き、あとはノード同士が
+空のときだけ DNS シード (mainnet では `seed.oagcoin.org` と
+`oagnode.vslabs.co.in`) を引き、あとはノード同士が
 住所を教え合います。外向きの接続を 8 本保ちます。
 
 家のルーターの内側では、ノードがルーターに (UPnP か NAT-PMP で) ポートを
