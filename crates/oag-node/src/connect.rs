@@ -394,7 +394,8 @@ fn spawn_dial(handle: NodeHandle, outbound: Outbound, addr: SocketAddr) {
 
         match connected {
             Ok(Ok(conn)) => {
-                let _ = handle.address_outcome(addr, DialOutcome::Connected).await;
+                // 繋がったかどうかは、ハンドシェイクを終えた `run_as` が
+                // 住所帳に返す。自分自身に繋いだ場合もそこで分かる。
                 if let Err(e) = peer::run_as(handle.clone(), conn, Direction::Outbound).await {
                     crate::log_warn!("dropped the exchange with {addr}: {e}");
                 }

@@ -121,6 +121,13 @@ const SUCCESS_STALE_SECS: i64 = 7 * 24 * 60 * 60;
 /// いま試している最中とみなす幅 (秒)。
 const IN_FLIGHT_SECS: i64 = 60;
 
+/// 繋いでみたら自分だった住所を、いくつまで覚えておくか。
+///
+/// 自分の住所はふつう数個しかない。上限を置くのは、相手が `version` の
+/// 乱数をそのまま送り返せば「自分だった」と思わせられるからである。
+/// 偽れるのは相手自身の住所だけで害は無いが、際限なく溜めはしない。
+const MAX_FOUND_OWN: usize = 16;
+
 /// 住所帳の 1 件。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Entry {
@@ -413,6 +420,12 @@ pub struct AddressBook {
     tried_table: Table,
     /// 自分自身の住所。覚えない。
     own: Vec<SocketAddr>,
+    /// 繋いでみたら自分だった住所。覚えない。
+    ///
+    /// `own` とは分けて持つ。`own` は [`AddressBook::set_own`] のたびに
+    /// 置き換わる (ポートの割り当てが切れれば空になる) が、こちらは
+    /// 実際に確かめた事実であり、置き換えで消えてはならない。
+    found_own: Vec<SocketAddr>,
     /// 保存先。`None` なら保存しない (試験用)。
     path: Option<PathBuf>,
     /// 保存していない変更があるか。
@@ -473,6 +486,7 @@ impl AddressBook {
             new_table: Table::new(NEW_BUCKET_COUNT),
             tried_table: Table::new(TRIED_BUCKET_COUNT),
             own: Vec::new(),
+            found_own: Vec::new(),
             path: None,
             dirty: false,
         }
@@ -564,8 +578,58 @@ impl AddressBook {
     }
 
     /// 自分自身の住所を登録する。以後、この住所は覚えない。
+    ///
+    /// **すでに覚えていれば忘れる。** `--external-addr` を付ける前の起動で
+    /// 他のノードから自分の住所を聞いていると、それが `peers.json` に
+    /// 残っている。残したままにすると、自分に繋ぎに行き続ける。
     pub fn set_own(&mut self, addrs: Vec<SocketAddr>) {
+        for addr in &addrs {
+            self.forget(addr);
+        }
         self.own = addrs;
+    }
+
+    /// 繋いでみたら自分自身だった住所を記録する。忘れて、以後は覚えない。
+    ///
+    /// `--external-addr` を渡されていないノードは自分の住所を知らない。
+    /// 他のノードから聞いた自分の住所に繋ぎに行き、ハンドシェイクで
+    /// 初めて自分だと分かる。**分かった時点で外さないと、何度でも
+    /// 繋ぎに行く。**
+    pub fn mark_own(&mut self, addr: SocketAddr) {
+        self.forget(&addr);
+        if self.found_own.contains(&addr) {
+            return;
+        }
+        if self.found_own.len() >= MAX_FOUND_OWN {
+            self.found_own.remove(0);
+        }
+        self.found_own.push(addr);
+    }
+
+    /// 自分自身の住所か。
+    fn is_own(&self, addr: &SocketAddr) -> bool {
+        self.own.contains(addr) || self.found_own.contains(addr)
+    }
+
+    /// 住所を表から外して忘れる。知らなければ何もしない。
+    fn forget(&mut self, addr: &SocketAddr) {
+        let Some(info) = self.entries.remove(addr) else {
+            return;
+        };
+        if info.in_tried {
+            let bucket = self.tried_bucket(addr);
+            let slot = self.slot(true, bucket, addr);
+            if self.tried_table.get(bucket, slot) == Some(*addr) {
+                self.tried_table.clear(bucket, slot);
+            }
+        }
+        for (bucket, slot) in info.new_slots {
+            let (bucket, slot) = (bucket as usize, slot as usize);
+            if self.new_table.get(bucket, slot) == Some(*addr) {
+                self.new_table.clear(bucket, slot);
+            }
+        }
+        self.dirty = true;
     }
 
     /// 覚えている件数。
@@ -670,7 +734,7 @@ impl AddressBook {
         last_seen: i64,
         now: i64,
     ) -> bool {
-        if !is_storable(self.network, &addr) || self.own.contains(&addr) {
+        if !is_storable(self.network, &addr) || self.is_own(&addr) {
             return false;
         }
         // 未来を名乗られても、いまより先には進めない。
@@ -895,7 +959,7 @@ impl AddressBook {
     /// 迎えると決まってから登録する。先に登録してから断ると、どちらの
     /// 表にも居ない項目が `entries` に残る。
     fn adopt(&mut self, addr: SocketAddr, now: i64) -> bool {
-        if !is_storable(self.network, &addr) || self.own.contains(&addr) {
+        if !is_storable(self.network, &addr) || self.is_own(&addr) {
             return false;
         }
         let bucket = self.tried_bucket(&addr);
@@ -1603,6 +1667,67 @@ mod tests {
         b.set_own(vec![addr(93, 184, 216, 1)]);
         assert!(!b.add(addr(93, 184, 216, 1), NOW, NOW));
         assert!(b.add(addr(93, 184, 216, 2), NOW, NOW));
+    }
+
+    #[test]
+    fn our_own_address_already_known_is_forgotten() {
+        // `--external-addr` を付ける前の起動で覚えてしまった自分の住所。
+        // 自分への TCP 接続は成功するので、tried にまで上がっている。
+        let mut b = book();
+        let own = addr(93, 184, 216, 1);
+        b.add(own, NOW, NOW);
+        b.mark_success(&own, NOW);
+        b.add(addr(94, 1, 1, 1), NOW, NOW);
+        assert_eq!(b.tried_len(), 1);
+
+        b.set_own(vec![own]);
+
+        assert!(b.get(&own).is_none());
+        assert_eq!(b.tried_len(), 0);
+        assert_eq!(b.len(), 1);
+        for _ in 0..50 {
+            assert!(!b.candidates(NOW, 10, &[]).contains(&own));
+        }
+    }
+
+    #[test]
+    fn an_address_found_to_be_ourselves_is_forgotten_for_good() {
+        let mut b = book();
+        let own = addr(93, 184, 216, 1);
+        // 別々の出どころから聞いて、new の枠を (たいてい) 複数取っている。
+        b.add_from(own, Some(addr(10, 1, 0, 1)), NOW, NOW);
+        b.add_from(own, Some(addr(20, 1, 0, 1)), NOW, NOW);
+        b.add(addr(94, 1, 1, 1), NOW, NOW);
+        let own_slots = b.entries[&own].new_slots.len();
+        let other_slots = b.new_table.len() - own_slots;
+
+        b.mark_own(own);
+
+        assert!(b.get(&own).is_none());
+        assert_eq!(b.new_len(), 1);
+        assert_eq!(
+            b.new_table.len(),
+            other_slots,
+            "a slot still holds our address"
+        );
+        assert!(!b.add(own, NOW, NOW), "learned our own address again");
+        // ポートの割り当てが切れて `own` が空になっても、確かめた事実は残る。
+        b.set_own(Vec::new());
+        assert!(!b.add(own, NOW, NOW), "learned our own address again");
+        b.mark_success(&own, NOW);
+        assert!(b.get(&own).is_none(), "a success brought our address back");
+    }
+
+    #[test]
+    fn addresses_found_to_be_ourselves_are_capped() {
+        let mut b = book();
+        for i in 0..(MAX_FOUND_OWN as u8 + 4) {
+            b.mark_own(addr(93, 184, 216, i + 1));
+        }
+        assert_eq!(b.found_own.len(), MAX_FOUND_OWN);
+        // 古いものから押し出される。
+        assert!(b.add(addr(93, 184, 216, 1), NOW, NOW));
+        assert!(!b.add(addr(93, 184, 216, MAX_FOUND_OWN as u8 + 4), NOW, NOW));
     }
 
     #[test]

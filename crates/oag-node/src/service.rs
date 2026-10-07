@@ -177,10 +177,12 @@ pub enum NodeEvent {
 /// 繋ぎに行った結果。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DialOutcome {
-    /// 繋がった。
+    /// 繋がり、ハンドシェイクも済んだ。
     Connected,
-    /// 繋がらなかった。
+    /// 繋がらなかった。ハンドシェイクで断られた場合も含む。
     Failed,
+    /// 繋いだ先が自分自身だった。
+    Ourselves,
 }
 
 /// ブロックを受け取った結果 (非同期側に返す形)。
@@ -1619,6 +1621,7 @@ impl Service {
                         }
                     }
                     DialOutcome::Failed => self.node.addresses_mut().mark_failure(&addr, at),
+                    DialOutcome::Ourselves => self.node.addresses_mut().mark_own(addr),
                 }
             }
             Request::PeerServices { addr, services } => {

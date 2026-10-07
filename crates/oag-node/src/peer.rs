@@ -45,13 +45,14 @@
 //!
 //! 外向きの接続は、切れれば [`crate::connect`] が補充する。
 
-use crate::service::NodeHandle;
+use crate::service::{DialOutcome, NodeHandle};
 use oag_net::message::{
     effective_services, GetHeaders, InvItem, InvKind, Message, VersionMessage, MAX_HEADERS,
     PROTOCOL_VERSION,
 };
 use oag_net::sync::PeerId;
 use oag_net::transport::{Connection, TransportError};
+use oag_net::HandshakeError;
 use oag_primitives::Hash;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -154,10 +155,24 @@ pub async fn run_as(
         .unwrap_or_else(|_| "?".to_string());
 
     let version = our_version(&handle).await?;
-    let theirs = conn
-        .handshake(version)
-        .await
-        .map_err(|e| format!("the handshake with {addr} failed: {e}"))?;
+    let handshake = conn.handshake(version).await;
+    // こちらから繋いだ相手なら、結果を住所帳に返す。**繋がったと記録する
+    // のはハンドシェイクが済んでから**である。TCP が繋がった時点で記録
+    // すると、自分自身への接続が「到達できる住所」として tried に上がり、
+    // 何度でも引かれる。
+    if direction == Direction::Outbound {
+        if let Ok(dialed) = conn.peer_addr() {
+            let outcome = match &handshake {
+                Ok(_) => DialOutcome::Connected,
+                Err(TransportError::Handshake(HandshakeError::SelfConnection)) => {
+                    DialOutcome::Ourselves
+                }
+                Err(_) => DialOutcome::Failed,
+            };
+            let _ = handle.address_outcome(dialed, outcome).await;
+        }
+    }
+    let theirs = handshake.map_err(|e| format!("the handshake with {addr} failed: {e}"))?;
     crate::log_peer!(
         "connected to {addr} ({}, height {})",
         theirs.user_agent,
