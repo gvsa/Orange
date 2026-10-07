@@ -363,7 +363,7 @@ fn rate(hashes_per_second: f64) -> String {
 }
 
 /// 経過時間の表記。
-fn ago(secs: u64) -> String {
+pub(crate) fn ago(secs: u64) -> String {
     if secs < 60 {
         format!("{secs} s")
     } else if secs < 3_600 {

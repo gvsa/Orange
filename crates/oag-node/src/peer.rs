@@ -45,7 +45,7 @@
 //!
 //! 外向きの接続は、切れれば [`crate::connect`] が補充する。
 
-use crate::service::{DialOutcome, NodeHandle};
+use crate::service::{ConnectedPeer, DialOutcome, NodeHandle};
 use oag_net::message::{
     effective_services, GetHeaders, InvItem, InvKind, Message, VersionMessage, MAX_HEADERS,
     PROTOCOL_VERSION,
@@ -180,6 +180,22 @@ pub async fn run_as(
     );
 
     let source = conn.peer_addr().ok();
+    if let Some(addr) = source {
+        let _ = handle
+            .peer_joined(
+                peer,
+                ConnectedPeer {
+                    addr,
+                    outbound: direction == Direction::Outbound,
+                    user_agent: theirs.user_agent.clone(),
+                    protocol_version: theirs.protocol_version,
+                    services: theirs.services,
+                    start_height: theirs.start_height,
+                    since: now(),
+                },
+            )
+            .await;
+    }
     // 名乗りを住所帳に控える。**こちらから繋いだ相手だけ**である。繋がれた
     // 側の住所は相手の一時ポートであり、次に繋ぎ直せる宛先ではない。
     if direction == Direction::Outbound {

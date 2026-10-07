@@ -2669,7 +2669,7 @@ separate interface means loosening one does not loosen the other.
 
 - Verbs `GET` and `HEAD` only; everything else is refused
 - Paths `/`, `/block/<height|hash>`, `/tx/<txid>`, `/address/<address>`,
-  `/mempool`, `/stats`, `/richlist`, `/search?q=`
+  `/mempool`, `/stats`, `/richlist`, `/peers`, `/search?q=`
 - Request headers up to 8 KB; one request per connection
 
 **Both paths and queries are strings the user chooses.** Every value embedded in
@@ -2716,6 +2716,23 @@ and each day's column carries its values in a `<title>`.
   size of the UTXO set itself
 - Timestamps can go backwards. A block that looks like it belongs to an earlier
   date goes into the current day, and a closed day is never reopened
+
+#### Peers (`/peers`)
+
+The peers that the node behind the explorer has finished a handshake with right
+now. **This is not a list of the whole network,** and the page says so.
+
+It shows the number of connections (outbound and inbound), the number of
+addresses in the address book, the number of peers per version, and how many run
+a version that enforces the soft fork (0.4.0 or later). Each connection is
+listed with its address, direction, user agent (such as `/oag-node:0.4.1/`),
+height when connected, what it serves, and how long it has been connected.
+
+- **Only the first two parts of an address are shown:** `203.168.*.*` for IPv4,
+  `2001:db8:*` for IPv6, and no port. The page is public, and the home
+  connections of the people who connect to it are not exposed as they are
+- The user agent is a string the peer chooses freely. It is escaped before it
+  goes into the page, and one whose version cannot be read is not counted
 
 #### List history oldest-first
 

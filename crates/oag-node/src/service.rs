@@ -39,7 +39,7 @@ use oag_net::sync::{BlockDownload, PeerId, TxRequests};
 use oag_pow::randomx::{RandomXVerifier, SharedDataset};
 use oag_primitives::{Amount, Hash, Network};
 use oag_store::{BlockSummary, IndexStats, TxLocation};
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::net::SocketAddr;
 use std::num::NonZeroUsize;
 use std::path::Path;
@@ -185,6 +185,25 @@ pub enum DialOutcome {
     Ourselves,
 }
 
+/// ハンドシェイクを終えて繋がっているピア 1 本 ([`NodeHandle::peers`])。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConnectedPeer {
+    /// 相手の住所。繋がれた側なら相手の一時ポートである。
+    pub addr: SocketAddr,
+    /// こちらから繋いだか。
+    pub outbound: bool,
+    /// 相手が名乗った名前 (`/oag-node:0.4.1/` など)。**相手が好きに決める。**
+    pub user_agent: String,
+    /// 相手のプロトコル版数。
+    pub protocol_version: u32,
+    /// 相手が名乗った提供機能。
+    pub services: u64,
+    /// 繋いだときに相手が名乗った高さ。
+    pub start_height: u64,
+    /// 繋がった時刻 (UNIX 秒)。
+    pub since: i64,
+}
+
 /// ブロックを受け取った結果 (非同期側に返す形)。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BlockAccepted {
@@ -263,8 +282,12 @@ enum Request {
         peer: PeerId,
         hashes: Vec<Hash>,
     },
+    /// ピアとのハンドシェイクが済んだ。
+    PeerJoined(PeerId, Box<ConnectedPeer>),
     /// ピアが切れた。頼んでいた分を待ち行列に戻す。
     PeerGone(PeerId),
+    /// いま繋がっているピアの一覧。
+    Peers(oneshot::Sender<Result<Vec<ConnectedPeer>, String>>),
     /// 外の採掘器に配る土台を組む (Stratum)。
     MiningJob {
         payout: Lock,
@@ -641,9 +664,19 @@ impl NodeHandle {
         self.tell(Request::BlocksNotFound { peer, hashes }).await
     }
 
+    /// ピアとのハンドシェイクが済んだことを伝える。
+    pub async fn peer_joined(&self, peer: PeerId, info: ConnectedPeer) -> Result<(), String> {
+        self.tell(Request::PeerJoined(peer, Box::new(info))).await
+    }
+
     /// ピアが切れたことを伝える。
     pub async fn peer_gone(&self, peer: PeerId) -> Result<(), String> {
         self.tell(Request::PeerGone(peer)).await
+    }
+
+    /// いま繋がっているピアの一覧。繋がった順に並ぶ。
+    pub async fn peers(&self) -> Result<Vec<ConnectedPeer>, String> {
+        self.ask(Request::Peers).await
     }
 
     /// `addr` で聞いた住所を住所帳に入れる。
@@ -906,6 +939,8 @@ struct Service {
     mined: u64,
     /// 外に名乗る自分自身の住所。運用者が明示したものだけを入れる。
     own_addresses: Vec<SocketAddr>,
+    /// ハンドシェイクを終えて繋がっているピア。番号は繋がった順に振られる。
+    connected: BTreeMap<PeerId, ConnectedPeer>,
     /// 畳んだ採掘スレッドの試行回数。いま走っている分は足していない。
     ///
     /// 実効ハッシュレートを出すために持つ。**掘れたブロック数から
@@ -1043,6 +1078,7 @@ impl NodeService {
                     events: events_for_thread,
                     mined: 0,
                     own_addresses: Vec::new(),
+                    connected: BTreeMap::new(),
                     attempts_base: 0,
                     rate_samples: VecDeque::new(),
                     mining_since: None,
@@ -1534,9 +1570,16 @@ impl Service {
                     self.download.not_found(&hash, peer);
                 }
             }
+            Request::PeerJoined(peer, info) => {
+                self.connected.insert(peer, *info);
+            }
             Request::PeerGone(peer) => {
+                self.connected.remove(&peer);
                 self.download.peer_disconnected(peer);
                 self.tx_requests.peer_disconnected(peer);
+            }
+            Request::Peers(reply) => {
+                let _ = reply.send(Ok(self.connected.values().cloned().collect()));
             }
             Request::MiningJob {
                 payout,

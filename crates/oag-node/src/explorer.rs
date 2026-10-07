@@ -27,13 +27,13 @@
 //! 新しい順に並べ替えるには全件を数える必要があり、それは「途中で
 //! 打ち切った」ことを利用者に隠したまま行うには危うい。
 
-use crate::service::{NodeHandle, TxRecord};
+use crate::service::{ConnectedPeer, NodeHandle, TxRecord};
 use crate::stats::{self, Tally};
 use oag_consensus::lock::Lock;
 use oag_consensus::{Block, Transaction};
 use oag_primitives::{Address, Amount, Hash, Network};
 use std::fmt::Write as _;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -198,6 +198,7 @@ async fn route(shared: &Shared, target: &str) -> Response {
         ["tx", rest @ ..] => tx_page(handle, &rest.join("/")).await,
         ["address", rest @ ..] => address_page(handle, &rest.join("/"), query).await,
         ["mempool"] => mempool_page(handle).await,
+        ["peers"] => peers_page(handle).await,
         _ => not_found("no such page"),
     }
 }
@@ -1150,6 +1151,166 @@ async fn mempool_page(handle: &NodeHandle) -> Response {
     ok(page("mempool", &body))
 }
 
+/// このノードに繋がっているピアの一覧。
+///
+/// # 住所を伏せる
+///
+/// 公開の頁である。繋いでくれている人の住所をそのまま出すと、家の回線を
+/// 晒すことになる。上位 2 区切りだけを残し ([`masked_ip`])、ポートも
+/// 出さない。どの辺りの回線か (プロバイダや地域) が分かる程度に留める。
+///
+/// # 見えるのはこのノードの周りだけ
+///
+/// ネットワーク全体の一覧ではない。エクスプローラーを載せたノードが
+/// いま握手を済ませている相手だけである。頁にもそう書く。
+async fn peers_page(handle: &NodeHandle) -> Response {
+    let peers = match handle.peers().await {
+        Ok(peers) => peers,
+        Err(e) => return error_page(&e),
+    };
+    let known = handle.status().await.map(|s| s.known_addresses).ok();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64);
+
+    let outbound = peers.iter().filter(|p| p.outbound).count();
+    let upgraded = peers
+        .iter()
+        .filter(|p| node_version(&p.user_agent).is_some_and(|v| v >= SOFT_FORK_VERSION))
+        .count();
+
+    let mut body = String::new();
+    body.push_str(&search_box(""));
+    body.push_str("<h1>peers</h1>");
+    body.push_str(
+        "<p class=\"note\">The nodes connected to the node behind this explorer right now, \
+         not the whole network. Addresses are cut down to their first two parts.</p>",
+    );
+
+    body.push_str("<div class=\"grid\">");
+    stat(&mut body, "connected", &peers.len().to_string());
+    stat(&mut body, "outbound", &outbound.to_string());
+    stat(&mut body, "inbound", &(peers.len() - outbound).to_string());
+    stat(
+        &mut body,
+        "addresses known",
+        &known.map_or_else(|| "—".to_string(), |n| group(n as u64)),
+    );
+    stat(
+        &mut body,
+        "on 0.4.0 or later",
+        &format!("{upgraded} / {}", peers.len()),
+    );
+    body.push_str("</div>");
+
+    if peers.is_empty() {
+        body.push_str("<p class=\"note\">no peers are connected.</p>");
+        return ok(page("peers", &body));
+    }
+
+    // 版ごとの数。多い順、同数なら名前順。
+    let mut versions: Vec<(&str, usize)> = Vec::new();
+    for peer in &peers {
+        match versions
+            .iter_mut()
+            .find(|(agent, _)| *agent == peer.user_agent)
+        {
+            Some((_, count)) => *count += 1,
+            None => versions.push((&peer.user_agent, 1)),
+        }
+    }
+    versions.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+    body.push_str("<h2>versions</h2><div class=\"wrap\"><table class=\"list\">");
+    body.push_str("<tr class=\"head\"><th>version</th><th class=\"num\">peers</th></tr>");
+    for (agent, count) in &versions {
+        let _ = write!(
+            body,
+            "<tr><td class=\"mono\">{}</td><td class=\"num\" data-label=\"peers\">{count}</td></tr>",
+            esc(agent)
+        );
+    }
+    body.push_str("</table></div>");
+
+    body.push_str("<h2>connected now</h2><div class=\"wrap\"><table class=\"list\">");
+    body.push_str(
+        "<tr class=\"head\"><th>address</th><th>direction</th><th>version</th>\
+         <th class=\"num\">height when connected</th><th>serves</th>\
+         <th class=\"num\">connected for</th></tr>",
+    );
+    for peer in &peers {
+        let _ = write!(
+            body,
+            "<tr><td class=\"mono\">{address}</td>\
+             <td data-label=\"direction\">{direction}</td>\
+             <td class=\"mono\" data-label=\"version\">{agent}</td>\
+             <td class=\"num\" data-label=\"height when connected\">{height}</td>\
+             <td data-label=\"serves\">{serves}</td>\
+             <td class=\"num\" data-label=\"connected for\">{since}</td></tr>",
+            address = esc(&masked_ip(peer.addr.ip())),
+            direction = if peer.outbound { "outbound" } else { "inbound" },
+            agent = esc(&peer.user_agent),
+            height = group(peer.start_height),
+            serves = serves(peer),
+            since = crate::pool_page::ago(now.saturating_sub(peer.since).max(0) as u64),
+        );
+    }
+    body.push_str("</table></div>");
+    ok(page("peers", &body))
+}
+
+/// 高さ 40,000 からの相対 locktime を強制する最初の版。
+const SOFT_FORK_VERSION: (u32, u32, u32) = (0, 4, 0);
+
+/// 名乗り (`/oag-node:0.4.1/`) から版数を読む。
+///
+/// **名乗りは相手が好きに決める。** 読めなければ `None` とし、数えない。
+/// 嘘をつかれても、この頁の数字が狂うだけで害は無い。
+fn node_version(user_agent: &str) -> Option<(u32, u32, u32)> {
+    let version = user_agent.strip_prefix("/oag-node:")?.split('/').next()?;
+    let mut parts = version.splitn(3, '.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    // `0.4.1-dev` のような後ろ書きは読み飛ばす。
+    let patch: String = parts
+        .next()?
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect();
+    Some((major, minor, patch.parse().ok()?))
+}
+
+/// 相手が配れると名乗ったもの。
+fn serves(peer: &ConnectedPeer) -> &'static str {
+    let services = oag_net::message::effective_services(peer.protocol_version, peer.services);
+    if services & oag_net::message::SERVICE_FULL_NODE != 0 {
+        "all blocks"
+    } else if services & oag_net::message::SERVICE_LIMITED != 0 {
+        "recent blocks"
+    } else {
+        "none"
+    }
+}
+
+/// 住所を上位 2 区切りだけ残して伏せる。
+///
+/// IPv4 は `203.168.*.*`、IPv6 は `2001:db8:*` の形にする。IPv4 を
+/// 写した IPv6 (`::ffff:a.b.c.d`) は IPv4 として扱う。
+pub(crate) fn masked_ip(ip: IpAddr) -> String {
+    match ip {
+        IpAddr::V4(v4) => {
+            let [a, b, _, _] = v4.octets();
+            format!("{a}.{b}.*.*")
+        }
+        IpAddr::V6(v6) => {
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return masked_ip(IpAddr::V4(v4));
+            }
+            let [a, b, ..] = v6.segments();
+            format!("{a:x}:{b:x}:*")
+        }
+    }
+}
+
 // ━━━━━━━━ 部品 ━━━━━━━━
 
 /// ブロック内の取引表の頁送り。区切る必要が無ければ空文字列を返す。
@@ -1464,7 +1625,7 @@ fn page(title: &str, body: &str) -> String {
          <meta name=\"robots\" content=\"noindex, nofollow\">\
          <title>{title} · Orange</title><style>{css}</style></head>\
          <body><header><a class=\"brand\" href=\"/\">Orange <span>OAG</span></a>\
-         <nav><a href=\"/\">overview</a> <a href=\"/stats\">stats</a> <a href=\"/mempool\">mempool</a></nav></header>\
+         <nav><a href=\"/\">overview</a> <a href=\"/stats\">stats</a> <a href=\"/mempool\">mempool</a> <a href=\"/peers\">peers</a></nav></header>\
          <main>{body}</main>\
          <footer>A local, read-only explorer. It cannot send coins or change settings.</footer>\
          </body></html>",
@@ -1916,6 +2077,30 @@ mod tests {
         let table = tx_table(&block, Network::Mainnet, 3, 3);
         assert!(table.contains("<th>#</th>"));
         assert!(!table.contains("/tx/"));
+    }
+
+    #[test]
+    fn peer_addresses_keep_only_their_first_two_parts() {
+        assert_eq!(masked_ip("203.168.96.48".parse().unwrap()), "203.168.*.*");
+        assert_eq!(
+            masked_ip("::ffff:68.233.113.1".parse().unwrap()),
+            "68.233.*.*"
+        );
+        assert_eq!(
+            masked_ip("2001:db8:85a3::8a2e:370:7334".parse().unwrap()),
+            "2001:db8:*"
+        );
+    }
+
+    #[test]
+    fn a_node_version_is_read_from_the_user_agent() {
+        assert_eq!(node_version("/oag-node:0.4.1/"), Some((0, 4, 1)));
+        assert_eq!(node_version("/oag-node:0.10.0-dev/"), Some((0, 10, 0)));
+        assert_eq!(node_version("/oag-node:0.3/"), None);
+        assert_eq!(node_version("/Satoshi:27.0.0/"), None);
+        assert_eq!(node_version("<script>"), None);
+        assert!(node_version("/oag-node:0.3.0/").unwrap() < SOFT_FORK_VERSION);
+        assert!(node_version("/oag-node:0.4.0/").unwrap() >= SOFT_FORK_VERSION);
     }
 
     #[test]

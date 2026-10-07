@@ -325,3 +325,53 @@ fn an_address_of_the_wrong_network_is_refused() {
     assert!(status.contains("404"), "{status}");
     drop(service);
 }
+
+/// 繋がっているピアが、住所を伏せた形で一覧に出ること。
+#[test]
+fn connected_peers_are_listed_with_their_addresses_cut_down() {
+    let (_dir, service, runtime, explorer) = start("peers");
+    let handle = service.handle();
+    let other_dir = TempDir::new("peers-other");
+    let other = NodeService::start(NETWORK, &other_dir.0).expect("a node can be started");
+    let other_handle = other.handle();
+
+    runtime.block_on(async {
+        let (_, body) = get(explorer, "/peers").await;
+        assert!(body.contains("no peers are connected"), "{body}");
+
+        let listener = oag_net::transport::Listener::bind(
+            oag_net::magic::magic_for(NETWORK),
+            "127.0.0.1:0".parse().unwrap(),
+        )
+        .await
+        .unwrap();
+        let other_addr = listener.local_addr().unwrap();
+        tokio::spawn(oag_node::accept_loop(other_handle, listener));
+        tokio::spawn(oag_node::connect::maintain(
+            handle.clone(),
+            oag_node::connect::Outbound::new(),
+            vec![other_addr],
+        ));
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while handle.peers().await.unwrap().is_empty() {
+            assert!(std::time::Instant::now() < deadline, "the peers never met");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        let (status, body) = get(explorer, "/peers").await;
+        assert!(status.contains("200"), "{status}");
+        assert!(body.contains("127.0.*.*"), "{body}");
+        assert!(
+            !body.contains("127.0.0.1") && !body.contains(&other_addr.port().to_string()),
+            "the full address leaked: {body}"
+        );
+        assert!(body.contains("outbound"), "{body}");
+        let agent = concat!("/oag-node:", env!("CARGO_PKG_VERSION"), "/");
+        assert!(body.contains(agent), "{body}");
+        assert!(
+            body.contains("1 / 1"),
+            "the upgraded count is wrong: {body}"
+        );
+    });
+}
