@@ -12,7 +12,7 @@
 
 use crate::codec::{write_varint, CodecError, Decode, Encode, Reader};
 use crate::tx::{OutPoint, Transaction, TxOutput};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// UTXO 1 件。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -100,11 +100,37 @@ pub fn apply_block_to(
 }
 
 /// ブロックの適用を取り消す。
+///
+/// # 同じブロックの中で作られ、使われた出力
+///
+/// ブロックの中で、先のトランザクションが作った出力を後のトランザクションが
+/// 使うことがある。mempool は親子を受け付け、ひな形は親を子の前に並べる
+/// ので、おつりをすぐ使う送金があれば普通に掘ったブロックがこの形になる。
+///
+/// その出力は `created` にも `spent` にも載るが、適用し終えた時点ではもう
+/// 無く、適用する前にもまだ無い。**どちらの側でも触ってはならない。**
+///
+/// 0.4.2 までは `created` を全部消そうとして、その出力で `MissingUtxo` に
+/// なった。仮に通っても、`spent` の側で存在しなかった出力を戻していた。
+/// 記憶域の失敗として扱われるので無効の印も付かず、こういうブロックを
+/// 抱えたノードは、それより前に戻るリオーグを永久にできなかった。
+///
+/// 巻き戻し情報の形は変えていない。0.4.2 までに書かれたものも、そのまま
+/// 正しく巻き戻せる。
 pub fn undo_block_from(utxo: &mut dyn UtxoWrite, undo: &UndoBlock) -> Result<(), UtxoError> {
+    let spent_here: HashSet<&OutPoint> = undo.spent.iter().map(|(outpoint, _)| outpoint).collect();
+    let created_here: HashSet<&OutPoint> = undo.created.iter().collect();
+
     for outpoint in &undo.created {
+        if spent_here.contains(outpoint) {
+            continue;
+        }
         utxo.remove(outpoint)?;
     }
     for (outpoint, entry) in &undo.spent {
+        if created_here.contains(outpoint) {
+            continue;
+        }
         if utxo.contains(outpoint)? {
             return Err(UtxoError::UndoMismatch(*outpoint));
         }
@@ -354,6 +380,32 @@ mod tests {
 
         set.undo_block(&undo1).unwrap();
         assert!(set.is_empty());
+    }
+
+    /// 親と子が同じブロックに入っていても、取り消せること。
+    /// 0.4.2 まではここで `MissingUtxo` になり、リオーグできなかった。
+    #[test]
+    fn a_chain_spent_within_one_block_can_be_undone() {
+        let mut set = UtxoSet::new();
+        let cb = coinbase(1);
+        set.apply_block(std::slice::from_ref(&cb), 1).unwrap();
+        let after_first = set.clone();
+
+        let cb_out = OutPoint::new(cb.txid(), 0);
+        let parent = spend(cb_out, Amount::from_oag(9).unwrap());
+        let mid = OutPoint::new(parent.txid(), 0);
+        let child = spend(mid, Amount::from_oag(8).unwrap());
+        let paid = OutPoint::new(child.txid(), 0);
+        let undo = set.apply_block(&[coinbase(2), parent, child], 2).unwrap();
+        assert!(!set.contains(&cb_out).unwrap());
+        assert!(!set.contains(&mid).unwrap(), "spent in the same block");
+        assert!(set.contains(&paid).unwrap());
+
+        set.undo_block(&undo).unwrap();
+        assert_eq!(set.len(), after_first.len());
+        assert_eq!(set.get(&cb_out), after_first.get(&cb_out));
+        assert!(!set.contains(&mid).unwrap(), "never resurrected");
+        assert!(!set.contains(&paid).unwrap());
     }
 
     #[test]

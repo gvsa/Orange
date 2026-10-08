@@ -35,6 +35,7 @@ scenario!(the_difficulty_is_fixed_until_the_window_is_full);
 scenario!(median_time_past_follows_the_chain);
 scenario!(a_reorg_matches_a_direct_build, two);
 scenario!(a_deep_reorg_stays_consistent, two);
+scenario!(a_block_spending_its_own_outputs_can_be_reorged_away);
 
 // headers-first 同期
 scenario!(headers_alone_do_not_move_the_tip);

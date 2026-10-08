@@ -980,3 +980,124 @@ pub fn relative_locktime_starts_at_its_height<S: ChainStore>(before: S, at: S) {
     assert_eq!(at.height().unwrap(), spend_height - 1);
     assert_eq!(entry_of(&at, &hash).status, BlockStatus::Invalid);
 }
+
+// ━━━━━━━━ 同じブロックの中で使われた出力 ━━━━━━━━
+
+/// 自分の中で作った出力を自分の中で使うブロックを、リオーグで外せること。
+///
+/// mempool は親子を受け付け、ひな形は親を子の前に並べる。おつりをすぐ
+/// 使う送金があれば、普通に掘ったブロックがこの形になる。
+///
+/// 0.4.2 までは、こういうブロックを巻き戻せなかった。巻き戻し情報の
+/// 「作った出力」を全部消そうとして、子が使ったぶんで `MissingUtxo` に
+/// なった。記憶域の失敗として扱われるので無効の印も付かず、そのノードは
+/// それより前に戻るリオーグを永久にできず、古い枝に取り残された。
+pub fn a_block_spending_its_own_outputs_can_be_reorged_away<S: ChainStore>(store: S) {
+    let mut chain = open(store);
+
+    // 高さ 1 のコインベースを、鍵を握っている出力にする。
+    let key = SecretKey::generate();
+    let lock = Lock::pay_to_pubkey(&key.public_key());
+    let genesis_hash = chain.tip().unwrap().hash;
+    let mut first = build_on(&chain, genesis_hash, 1);
+    first.transactions[0].outputs[0].lock = lock.clone();
+    first.header.merkle_root = merkle::merkle_root(&[first.transactions[0].txid()]).unwrap();
+    let coin = OutPoint::new(first.transactions[0].txid(), 0);
+    let coin_output = first.transactions[0].outputs[0].clone();
+    chain.accept_block(first, &AcceptAnyPow, NOW).unwrap();
+
+    // 成熟するまで積む。
+    let spend_height = 1 + oag_consensus::params::COINBASE_MATURITY;
+    let tip = chain.tip().unwrap().hash;
+    extend(&mut chain, tip, (spend_height - 2) as usize, 2);
+    assert_eq!(chain.height().unwrap(), spend_height - 1);
+
+    let sign = |tx: &mut Transaction, spent: &TxOutput| {
+        let msg = sighash(tx, std::slice::from_ref(spent), 0, SighashType::DEFAULT).unwrap();
+        tx.inputs[0].signature = key.sign(&msg).to_bytes().to_vec();
+    };
+
+    // 親: コインを使う。子: 親の出力を、同じブロックの中で使う。
+    let mut parent = Transaction {
+        version: CURRENT_TX_VERSION,
+        inputs: vec![TxInput::new(coin)],
+        outputs: vec![TxOutput::new(
+            coin_output
+                .amount
+                .checked_sub("0.01".parse().unwrap())
+                .unwrap(),
+            lock.clone(),
+        )],
+        locktime: 0,
+    };
+    sign(&mut parent, &coin_output);
+    let change = OutPoint::new(parent.txid(), 0);
+    let change_output = parent.outputs[0].clone();
+
+    let mut child = Transaction {
+        version: CURRENT_TX_VERSION,
+        inputs: vec![TxInput::new(change)],
+        outputs: vec![TxOutput::new(
+            change_output
+                .amount
+                .checked_sub("0.01".parse().unwrap())
+                .unwrap(),
+            lock,
+        )],
+        locktime: 0,
+    };
+    sign(&mut child, &change_output);
+    let paid = OutPoint::new(child.txid(), 0);
+
+    let fork_point = chain.tip().unwrap().hash;
+    let mut block = build_on(&chain, fork_point, 999);
+    block.transactions.push(parent);
+    block.transactions.push(child);
+    let txids: Vec<Hash> = block.transactions.iter().map(|t| t.txid()).collect();
+    block.header.merkle_root = merkle::merkle_root(&txids).unwrap();
+    let chained = block.header.hash();
+    assert_eq!(
+        chain.accept_block(block, &AcceptAnyPow, NOW).unwrap(),
+        AcceptOutcome::ExtendedTip
+    );
+
+    let utxo_has = |chain: &Chain<S>, outpoint: &OutPoint| {
+        chain
+            .utxo_view()
+            .expect("a view can be taken")
+            .get(outpoint)
+            .expect("readable")
+            .is_some()
+    };
+    assert!(!utxo_has(&chain, &coin), "the coin was spent");
+    assert!(
+        !utxo_has(&chain, &change),
+        "the change was spent in the same block"
+    );
+    assert!(utxo_has(&chain, &paid));
+
+    // 分岐点から、より重い枝を積む。
+    let mut tip = fork_point;
+    let mut side = Vec::new();
+    for i in 0..2 {
+        let block = build_on(&chain, tip, 5_000 + i);
+        tip = block.header.hash();
+        side.push(tip);
+        let outcome = chain.accept_block(block, &AcceptAnyPow, NOW).unwrap();
+        if i == 1 {
+            match outcome {
+                AcceptOutcome::Reorganized(reorg) => {
+                    assert_eq!(reorg.disconnected, vec![chained]);
+                    assert_eq!(reorg.connected, side);
+                }
+                other => panic!("it did not reorg: {other:?}"),
+            }
+        }
+    }
+
+    // 外したブロックが使ったコインは戻り、作ったものはどちらも残らない。
+    assert_eq!(chain.tip().unwrap().hash, *side.last().unwrap());
+    assert!(utxo_has(&chain, &coin), "the coin came back");
+    assert!(!utxo_has(&chain, &change), "the change must not reappear");
+    assert!(!utxo_has(&chain, &paid), "the payment was undone");
+}
