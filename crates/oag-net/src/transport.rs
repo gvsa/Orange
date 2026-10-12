@@ -15,7 +15,7 @@
 //! 加え、**実際に溜まった量**も見張る。長さの宣言をせずに延々と送り続ける
 //! 相手からメモリを守るためである。
 
-use crate::frame::{self, FrameError, HEADER_LEN, MAX_PAYLOAD};
+use crate::frame::{self, FrameError, HANDSHAKE_MAX_PAYLOAD, HEADER_LEN, MAX_PAYLOAD};
 use crate::handshake::{Handshake, HandshakeError};
 use crate::magic::MAGIC_LEN;
 use crate::message::{Message, VersionMessage};
@@ -58,6 +58,8 @@ pub struct Connection {
     stream: TcpStream,
     magic: [u8; MAGIC_LEN],
     buffer: Vec<u8>,
+    /// いま受け付けるペイロードの上限。ハンドシェイクの間だけ下げる。
+    max_payload: usize,
 }
 
 impl Connection {
@@ -67,6 +69,7 @@ impl Connection {
             stream,
             magic,
             buffer: Vec::with_capacity(READ_CHUNK),
+            max_payload: MAX_PAYLOAD,
         }
     }
 
@@ -98,13 +101,16 @@ impl Connection {
     pub async fn recv(&mut self) -> Result<Message, TransportError> {
         loop {
             // 溜まっている分から取り出せるなら、読まずに返す。
-            if let Some((message, consumed)) = frame::decode(self.magic, &self.buffer)? {
+            if let Some((message, consumed)) =
+                frame::decode_with_limit(self.magic, &self.buffer, self.max_payload)?
+            {
                 self.buffer.drain(..consumed);
                 return Ok(message);
             }
 
-            if self.buffer.len() > MAX_BUFFERED {
-                return Err(TransportError::BufferOverflow { max: MAX_BUFFERED });
+            let max_buffered = HEADER_LEN + self.max_payload + READ_CHUNK;
+            if self.buffer.len() > max_buffered {
+                return Err(TransportError::BufferOverflow { max: max_buffered });
             }
 
             let mut chunk = [0u8; READ_CHUNK];
@@ -127,12 +133,15 @@ impl Connection {
         let ours = state.start(our_version);
         self.send(&ours).await?;
 
+        // 名乗り合いが済むまでは小さな上限で読む。済んだら元に戻す。
+        self.max_payload = HANDSHAKE_MAX_PAYLOAD;
         while !state.is_ready() {
             let message = self.recv().await?;
             for reply in state.on_message(&message)? {
                 self.send(&reply).await?;
             }
         }
+        self.max_payload = MAX_PAYLOAD;
 
         Ok(state
             .peer_version()

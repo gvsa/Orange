@@ -303,6 +303,7 @@ journalctl -u oag-node -f
 | `balance` | 残高を見る |
 | `send <宛先> <額>` | 送る |
 | `consolidate` | 細かい UTXO をまとめる |
+| `commit <16進>` | 2〜40 バイトをチェーンに刻む (コミットメント出力) |
 | `pst` | 部分署名取引 (PSBT 相当) |
 | `info` | 繋いでいるノードの状態 |
 
@@ -332,6 +333,23 @@ oag-wallet send <宛先> 1.5                # 送る
 
 **復元語句は一度しか出ない場面がある。** `new` の出力は必ず控える。
 控えを取らずに閉じると、その財布は誰にも戻せない。
+
+### commit — チェーンに刻む
+
+金額 0 で、2〜40 バイトを刻むだけの出力 (コミットメント出力、`SPEC.md` §7.7)
+を 1 つ作る。ふつうはハッシュ (32 バイト) を入れる。タイムスタンプ、リリースの
+証明、鍵の引き継ぎの宣言などに使う。**誰にも使えない出力**で、払うのは手数料
+だけ。残りはおつりとして戻る。
+
+```sh
+# ファイルの SHA-256 を刻む
+oag-wallet --network mainnet commit "$(sha256sum release.tar.gz | cut -d' ' -f1)" --dry-run
+oag-wallet --network mainnet commit "$(sha256sum release.tar.gz | cut -d' ' -f1)"
+```
+
+**ソフトフォークが有効になるまでは送らない** (`SPEC.md` §10.9)。ノードの
+`getinfo` の `softfork.state` が `active` になるまで、`--dry-run` 以外は断る。
+有効化の前はノードも中継しない。
 
 ### sign / verify — アドレスの持ち主であることを示す
 
@@ -428,6 +446,21 @@ Windows やチャットを経由すると LF が CRLF に書き換わる。ど�
 | `getmempool` | なし |
 | `sendrawtransaction` | `[16進]` |
 | `scanutxos` | `[[アドレス, …]]` |
+
+`getinfo` の `softfork` は、0.5.0 のソフトフォーク (コミットメント出力と
+署名の `0x00`、`SPEC.md` §10.9) の様子である。
+
+| 項目 | 中身 |
+| --- | --- |
+| `state` | `defined` / `started` / `locked_in` / `active` / `failed` |
+| `bit` / `period` / `threshold` | 印のビット、区切り、閾値 (mainnet は 1 / 1440 / 960) |
+| `startheight` / `timeoutheight` | 数え始めと期限 |
+| `signalled` / `elapsed` | いまの区切りで印の付いた数と、積まれた数 |
+
+testnet と regtest は最初から `active` で、`bit` などは `null` になる。
+
+出力 (`getblock`、`getrawtransaction` の `vout`) のうちコミットメント出力は、
+`address` が `null` で、`commitment` に中身の 16 進が入る。
 
 `getrawtransaction` の確定分と `getaddresshistory` は索引を要る。
 **索引が無いときは空の答えではなく誤りを返す。** 「見つからない」と

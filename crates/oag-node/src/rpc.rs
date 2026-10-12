@@ -213,6 +213,19 @@ async fn get_info(handle: &NodeHandle) -> Result<Value, RpcError> {
         // 0 でなければ、それより下のブロックは配れない (SPEC §14.5)。
         "blocksfrom": status.blocks_from,
         "pruned": status.blocks_from > 0,
+        // コミットメント出力などのソフトフォーク (SPEC §10.9)。
+        // プールの運営者が、印が付いているかを確かめるのに使う。
+        "softfork": {
+            "name": "commitments",
+            "state": status.softfork.state.name(),
+            "bit": status.softfork.deployment.map(|d| d.bit),
+            "startheight": status.softfork.deployment.map(|d| d.start_height),
+            "timeoutheight": status.softfork.deployment.map(|d| d.timeout_height),
+            "period": status.softfork.deployment.map(|d| d.period),
+            "threshold": status.softfork.deployment.map(|d| d.threshold),
+            "signalled": status.softfork.signals.map(|(count, _)| count),
+            "elapsed": status.softfork.signals.map(|(_, elapsed)| elapsed),
+        },
         // 軽量モードのときだけ入る。通常のノードでは null。
         "light": status.light.map(|l| json!({
             "scannedto": l.scanned_to,
@@ -488,7 +501,11 @@ fn tx_json(tx: &Transaction, network: Network) -> Value {
                 "amountoag": out.amount.to_string(),
                 "lockversion": out.lock.version(),
                 "lock": to_hex(out.lock.payload()),
-                "address": out.lock.to_address(network).ok().map(|a| a.to_string()),
+                // コミットメント出力はアドレスにしない (SPEC §7.7)。
+                "address": (!out.lock.is_commitment())
+                    .then(|| out.lock.to_address(network).ok().map(|a| a.to_string()))
+                    .flatten(),
+                "commitment": out.lock.is_commitment().then(|| to_hex(out.lock.payload())),
             }))
             .collect::<Vec<Value>>(),
     })

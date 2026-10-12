@@ -597,6 +597,9 @@ fn verify_input(cache: &SighashCache<'_>, index: usize, lock: &Lock) -> Result<(
     let field = &tx.inputs[index].signature;
     let (bytes, hash_type) = match field.len() {
         64 => (&field[..], SighashType::DEFAULT),
+        // 既定形式を 65 バイトで書いたもの。txid を変えるための形であり、
+        // ソフトフォークの後は無効になる (SPEC §8.3)。受け取らない。
+        65 if field[64] == 0x00 => return Err(PstError::BadSignature { index }),
         65 => (
             &field[..64],
             SighashType::from_byte(field[64]).map_err(|_| PstError::BadSignature { index })?,

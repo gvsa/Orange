@@ -17,6 +17,7 @@
 
 pub mod block;
 pub mod codec;
+pub mod deployment;
 pub mod lock;
 pub mod params;
 pub mod sighash;
@@ -32,5 +33,5 @@ pub use tx::{OutPoint, Transaction, TxInput, TxOutput};
 pub use utxo::{UtxoEntry, UtxoSet, UtxoView};
 pub use validate::{
     validate_block, validate_header, validate_transaction, BlockContext, HeaderContext,
-    PowVerifier, SignatureChecks, ValidationError,
+    PowVerifier, Rules, SignatureChecks, ValidationError,
 };

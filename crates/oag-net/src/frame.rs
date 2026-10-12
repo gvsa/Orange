@@ -32,6 +32,12 @@ pub const HEADER_LEN: usize = MAGIC_LEN + COMMAND_LEN + 4 + 4;
 /// (5,000 項目 × 33 バイト = 165,000 バイト) の双方が余裕をもって収まる。
 pub const MAX_PAYLOAD: usize = 1024 * 1024;
 
+/// ハンドシェイクの間のペイロードの上限 ([`decode_with_limit`])。
+///
+/// `version` は名乗り (最大 64 バイト) を入れても 120 バイトほどである。
+/// 余裕を見て 1 KiB にする。
+pub const HANDSHAKE_MAX_PAYLOAD: usize = 1024;
+
 /// チェックサムの長さ。
 pub const CHECKSUM_LEN: usize = 4;
 
@@ -95,6 +101,21 @@ pub fn encode(magic: [u8; MAGIC_LEN], message: &Message) -> Vec<u8> {
 /// - `Ok(Some((message, 消費バイト数)))` — 1 個取り出せた
 /// - `Err(_)` — 壊れている。接続を切るべき
 pub fn decode(magic: [u8; MAGIC_LEN], buf: &[u8]) -> Result<Option<(Message, usize)>, FrameError> {
+    decode_with_limit(magic, buf, MAX_PAYLOAD)
+}
+
+/// [`decode`] と同じだが、ペイロードの上限を `max_payload` に下げる。
+///
+/// ハンドシェイクの間は `version` と `verack` しか来ないはずなので、
+/// 小さな上限で読む ([`HANDSHAKE_MAX_PAYLOAD`])。名乗り合う前の相手に、
+/// 1 MiB ぶん溜め込ませる理由が無い。`max_payload` は [`MAX_PAYLOAD`] を
+/// 超えても [`MAX_PAYLOAD`] に抑える。
+pub fn decode_with_limit(
+    magic: [u8; MAGIC_LEN],
+    buf: &[u8],
+    max_payload: usize,
+) -> Result<Option<(Message, usize)>, FrameError> {
+    let max_payload = max_payload.min(MAX_PAYLOAD);
     if buf.len() < HEADER_LEN {
         return Ok(None);
     }
@@ -115,10 +136,10 @@ pub fn decode(magic: [u8; MAGIC_LEN], buf: &[u8]) -> Result<Option<(Message, usi
     let length = u32::from_le_bytes(length_bytes) as usize;
 
     // 長さの検査は読み込む前に行う。
-    if length > MAX_PAYLOAD {
+    if length > max_payload {
         return Err(FrameError::PayloadTooLarge {
             actual: length,
-            max: MAX_PAYLOAD,
+            max: max_payload,
         });
     }
 
@@ -154,6 +175,40 @@ fn parse_command(field: &[u8]) -> Result<String, FrameError> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn the_handshake_limit_refuses_a_large_frame_before_reading_it() {
+        let magic = [1, 2, 3, 4];
+        let big = Message::Addr(
+            (0..100)
+                .map(|i| {
+                    crate::message::NetAddress::from_socket(
+                        std::net::SocketAddr::from(([10, 0, 0, i as u8], 9444)),
+                        0,
+                        0,
+                    )
+                })
+                .collect(),
+        );
+        let bytes = encode(magic, &big);
+        assert!(bytes.len() - HEADER_LEN > HANDSHAKE_MAX_PAYLOAD);
+        // 長さを宣言した見出しだけで断る。本体を待たない。
+        assert!(matches!(
+            decode_with_limit(magic, &bytes[..HEADER_LEN], HANDSHAKE_MAX_PAYLOAD),
+            Err(FrameError::PayloadTooLarge { max, .. }) if max == HANDSHAKE_MAX_PAYLOAD
+        ));
+        // 普段の上限なら読める。
+        assert!(decode(magic, &bytes).unwrap().is_some());
+        // 上限は MAX_PAYLOAD を超えない。
+        assert!(decode_with_limit(magic, &bytes, usize::MAX)
+            .unwrap()
+            .is_some());
+        // 小さいもの (version) はハンドシェイクの上限でも読める。
+        let verack = encode(magic, &Message::Verack);
+        assert!(decode_with_limit(magic, &verack, HANDSHAKE_MAX_PAYLOAD)
+            .unwrap()
+            .is_some());
+    }
     use super::*;
     use crate::magic::{magic_for, MAGIC_MAINNET, MAGIC_TESTNET};
     use crate::message::{GetHeaders, InvItem, NetAddress, VersionMessage, PROTOCOL_VERSION};

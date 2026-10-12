@@ -19,7 +19,7 @@ use oag_consensus::lock::Lock;
 use oag_consensus::tx::{OutPoint, TxInput, CURRENT_TX_VERSION};
 use oag_consensus::utxo::{UndoBlock, UtxoEntry, UtxoError, UtxoSet, UtxoView};
 use oag_consensus::validate::AcceptAnyPow;
-use oag_consensus::{Block, Transaction, TxOutput};
+use oag_consensus::{Block, Rules, Transaction, TxOutput};
 use oag_primitives::{merkle, Amount, Hash, SecretKey};
 
 /// 読み取りを任意の時点で失敗させられる記憶域。
@@ -108,8 +108,8 @@ impl ChainStore for FlakyStore {
         self.inner.put_index_entry(entry)
     }
 
-    fn connect_block(&self, block: &Block) -> Result<UndoBlock, Self::Error> {
-        self.inner.connect_block(block)
+    fn connect_block(&self, block: &Block, rules: Rules) -> Result<UndoBlock, Self::Error> {
+        self.inner.connect_block(block, rules)
     }
 
     fn disconnect_tip(&self) -> Result<Hash, Self::Error> {

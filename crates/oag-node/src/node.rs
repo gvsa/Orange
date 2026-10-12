@@ -106,6 +106,19 @@ pub struct NodeStatus {
     /// **`Node` は埋めない。** 走査の状態を持っているのは
     /// [`crate::service`] 側なので、あちらが後から入れる。
     pub light: Option<LightStatus>,
+    /// コミットメント出力などのソフトフォークの様子 (SPEC §10.9)。
+    pub softfork: SoftForkStatus,
+}
+
+/// ソフトフォークの有効化の様子 (SPEC §10.9)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SoftForkStatus {
+    /// 次のブロックでの状態。
+    pub state: oag_consensus::deployment::DeploymentState,
+    /// 印で有効にする場合の決まり。最初から有効なネットワークでは `None`。
+    pub deployment: Option<oag_consensus::deployment::Deployment>,
+    /// 先端を含む区切りで、印の付いたブロックの数と、積まれたブロックの数。
+    pub signals: Option<(u64, u64)>,
 }
 
 /// 軽量モードの様子。
@@ -249,6 +262,7 @@ impl Node {
         let mut chain = Chain::open(store, genesis, network.genesis_difficulty(), retarget)?;
         chain.set_assume_valid(options.assume_valid.resolve(network));
         chain.set_relative_locktime_height(network.relative_locktime_height());
+        chain.set_commitment_activation(oag_consensus::deployment::commitment_activation(network));
 
         // 0.1.1 までは、初期同期でシードのエポックをまたぐと、正しいブロックに
         // 無効の印が付くことがあった (`Chain::reconsider_invalid`)。印は
@@ -316,9 +330,10 @@ impl Node {
         let median_time_past = self.chain.median_time_past_for_child_of(&tip.hash)?;
         let view = self.chain.utxo_view()?;
         let times = self.chain.times_on(tip.hash);
+        let rules = self.chain.rules_for_child_of(&tip.hash)?;
         Ok(self
             .mempool
-            .accept(tx, &view, next_height, median_time_past, &times))
+            .accept(tx, &view, next_height, median_time_past, &times, rules))
     }
 
     /// 現在の様子。
@@ -337,6 +352,14 @@ impl Node {
             known_addresses: self.addresses.len(),
             blocks_from: self.chain.store().blocks_from()?,
             light: None,
+            softfork: SoftForkStatus {
+                state: self.chain.deployment_state_for_child_of(&tip.hash)?,
+                deployment: match self.chain.commitment_activation() {
+                    oag_consensus::deployment::Activation::Signalled(d) => Some(d),
+                    _ => None,
+                },
+                signals: self.chain.signals_so_far(&tip.hash)?,
+            },
         })
     }
 
@@ -454,8 +477,15 @@ impl Node {
         let median_time_past = self.chain.median_time_past_for_child_of(&tip.hash)?;
         let view = self.chain.utxo_view()?;
         let times = self.chain.times_on(tip.hash);
-        self.mempool
-            .rebuild_after_reorg(orphaned, &view, next_height, median_time_past, &times);
+        let rules = self.chain.rules_for_child_of(&tip.hash)?;
+        self.mempool.rebuild_after_reorg(
+            orphaned,
+            &view,
+            next_height,
+            median_time_past,
+            &times,
+            rules,
+        );
         Ok(())
     }
 
@@ -510,6 +540,8 @@ impl Node {
             prev_hash,
             height,
             difficulty,
+            // ソフトフォークの印 (SPEC §10.9)。数えている間だけ付く。
+            version: self.chain.block_version_for_child_of(&prev_hash)?,
             timestamp,
             payout: payout.clone(),
             extra_nonce: extra_nonce.to_le_bytes().to_vec(),

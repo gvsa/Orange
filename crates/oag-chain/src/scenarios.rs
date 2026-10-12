@@ -9,13 +9,14 @@ use crate::chain::{AcceptOutcome, Chain, ChainError, HeaderOutcome, Retarget};
 use crate::genesis::GenesisSpec;
 use crate::index::BlockStatus;
 use crate::store::ChainStore;
+use oag_consensus::deployment::{Activation, Deployment, DeploymentState};
 use oag_consensus::lock::Lock;
 use oag_consensus::sighash::{sighash, SighashType};
 use oag_consensus::tx::{
     encode_coinbase_signature, OutPoint, TxInput, CURRENT_TX_VERSION, SEQUENCE_TYPE_FLAG,
 };
 use oag_consensus::utxo::UtxoView;
-use oag_consensus::validate::AcceptAnyPow;
+use oag_consensus::validate::{AcceptAnyPow, Rules};
 use oag_consensus::{Block, BlockHeader, Transaction, TxOutput};
 use oag_primitives::{merkle, Amount, Hash, Network, SecretKey};
 
@@ -1100,4 +1101,587 @@ pub fn a_block_spending_its_own_outputs_can_be_reorged_away<S: ChainStore>(store
     assert!(utxo_has(&chain, &coin), "the coin came back");
     assert!(!utxo_has(&chain, &change), "the change must not reappear");
     assert!(!utxo_has(&chain, &paid), "the payment was undone");
+}
+
+// ━━━━━━━━ 採掘者の印による有効化 (SPEC §10.9) ━━━━━━━━
+
+/// 試験用の小さな有効化の決まり。
+///
+/// 区切りは 4 ブロック、閾値は 3。数え始めは高さ 124 で、高さ 1 の
+/// コインベースが成熟する (1 + 120) より後に置いてある。
+pub const TEST_DEPLOYMENT: Deployment = Deployment {
+    bit: 1,
+    start_height: 124,
+    timeout_height: 124 + 4 * 50,
+    period: 4,
+    threshold: 3,
+};
+
+/// 印を付けたブロックの version。
+const SIGNAL: u32 = TEST_DEPLOYMENT.version_bits();
+
+/// 印で有効化するチェーンを起こす。
+pub fn open_signalled<S: ChainStore>(store: S, deployment: Deployment) -> Chain<S> {
+    let mut chain = open(store);
+    chain.set_commitment_activation(Activation::Signalled(deployment));
+    chain
+}
+
+/// 高さ 1 のコインベースを、鍵で使える出力にして積む。
+fn fund_at_height_one<S: ChainStore>(chain: &mut Chain<S>) -> (SecretKey, OutPoint, TxOutput) {
+    let key = SecretKey::generate();
+    let genesis_hash = chain.tip().unwrap().hash;
+    let mut first = build_on(chain, genesis_hash, 1);
+    first.transactions[0].outputs[0].lock = Lock::pay_to_pubkey(&key.public_key());
+    first.header.merkle_root = merkle::merkle_root(&[first.transactions[0].txid()]).unwrap();
+    let coin = OutPoint::new(first.transactions[0].txid(), 0);
+    let output = first.transactions[0].outputs[0].clone();
+    chain.accept_block(first, &AcceptAnyPow, NOW).unwrap();
+    (key, coin, output)
+}
+
+/// `parent` の上に、`version` を付けたブロックを積む。返すのはそのブロック。
+fn push_with_version<S: ChainStore>(
+    chain: &mut Chain<S>,
+    parent: Hash,
+    salt: u64,
+    version: u32,
+    extra: Vec<Transaction>,
+) -> Result<(Block, AcceptOutcome), ChainError> {
+    let mut block = build_on(chain, parent, salt);
+    block.header.version = version;
+    block.transactions.extend(extra);
+    let txids: Vec<Hash> = block.transactions.iter().map(|t| t.txid()).collect();
+    block.header.merkle_root = merkle::merkle_root(&txids).unwrap();
+    let outcome = chain.accept_block(block.clone(), &AcceptAnyPow, NOW)?;
+    Ok((block, outcome))
+}
+
+/// 先端から、`signal(高さ)` の答えに従って印を付けながら `count` 個積む。
+fn extend_signalling<S: ChainStore>(
+    chain: &mut Chain<S>,
+    count: u64,
+    salt: u64,
+    signal: impl Fn(u64) -> bool,
+) -> Vec<Block> {
+    let mut blocks = Vec::new();
+    for i in 0..count {
+        let tip = chain.tip().unwrap();
+        let version = if signal(tip.height() + 1) { SIGNAL } else { 0 };
+        let (block, _) =
+            push_with_version(chain, tip.hash, salt * 1_000_000 + i, version, vec![]).unwrap();
+        blocks.push(block);
+    }
+    blocks
+}
+
+/// `spent` を使い、`outputs` を並べた取引。版数 0 なら鍵で署名する。
+fn pay(key: &SecretKey, from: OutPoint, spent: &TxOutput, outputs: Vec<TxOutput>) -> Transaction {
+    let mut tx = Transaction {
+        version: CURRENT_TX_VERSION,
+        inputs: vec![TxInput::new(from)],
+        outputs,
+        locktime: 0,
+    };
+    if spent.lock.version() == 0 {
+        let msg = sighash(&tx, std::slice::from_ref(spent), 0, SighashType::DEFAULT).unwrap();
+        tx.inputs[0].signature = key.sign(&msg).to_bytes().to_vec();
+    }
+    tx
+}
+
+fn note(amount: Amount) -> TxOutput {
+    TxOutput::new(amount, Lock::commitment(b"orange".to_vec()).unwrap())
+}
+
+fn state_after<S: ChainStore>(chain: &Chain<S>) -> DeploymentState {
+    let tip = chain.tip().unwrap().hash;
+    chain.deployment_state_for_child_of(&tip).unwrap()
+}
+
+fn in_utxo<S: ChainStore>(chain: &Chain<S>, outpoint: &OutPoint) -> bool {
+    chain
+        .utxo_view()
+        .expect("a view can be taken")
+        .get(outpoint)
+        .expect("readable")
+        .is_some()
+}
+
+/// 印が閾値に届くと `LockedIn` になり、次の区切りで規則が効くこと。
+///
+/// - 猶予の区切りで印が消えても取り消されない。
+/// - 効く前のブロックでは、金額付きのコミットメント出力も、末尾 `0x00` の
+///   署名も通る (さかのぼって無効にしない)。
+/// - 効いた後のブロックでは、どちらも無効になる。
+/// - 効く前に作られたコミットメント出力は、効いた後も UTXO に残り、使える。
+/// - 0.4.3 と同じ形 (同じブロックの中で親の出力を子が使う) を混ぜても崩れない。
+pub fn signals_lock_in_and_then_activate_the_rules<S: ChainStore>(store: S) {
+    let mut chain = open_signalled(store, TEST_DEPLOYMENT);
+    let (key, coin, coin_output) = fund_at_height_one(&mut chain);
+    let lock = Lock::pay_to_pubkey(&key.public_key());
+
+    // 高さ 122 まで積む。次 (123) はまだ数え始める前の区切り。
+    extend_signalling(&mut chain, 121, 1, |_| false);
+    assert_eq!(chain.height().unwrap(), 122);
+    assert_eq!(state_after(&chain), DeploymentState::Defined);
+    let tip = chain.tip().unwrap().hash;
+    assert_eq!(chain.block_version_for_child_of(&tip).unwrap(), 0);
+    assert_eq!(chain.rules_for_child_of(&tip).unwrap(), Rules::NONE);
+
+    // 高さ 123 を積むと、次 (124) から数え始める。印を付けるよう求められる。
+    extend_signalling(&mut chain, 1, 2, |_| false);
+    assert_eq!(state_after(&chain), DeploymentState::Started);
+    let tip = chain.tip().unwrap().hash;
+    assert_eq!(chain.block_version_for_child_of(&tip).unwrap(), SIGNAL);
+    assert_eq!(chain.signals_so_far(&tip).unwrap(), Some((0, 4)));
+
+    // 124〜127 のうち 3 個に印 (126 だけ付けない)。閾値ちょうど。
+    extend_signalling(&mut chain, 4, 3, |h| h != 126);
+    assert_eq!(chain.height().unwrap(), 127);
+    let tip = chain.tip().unwrap().hash;
+    assert_eq!(chain.signals_so_far(&tip).unwrap(), Some((3, 4)));
+    assert_eq!(state_after(&chain), DeploymentState::LockedIn);
+    assert_eq!(
+        chain.block_version_for_child_of(&tip).unwrap(),
+        SIGNAL,
+        "keep signalling through the grace period"
+    );
+
+    // 猶予の区切り (128〜131) では誰も印を付けない。それでも取り消されない。
+    extend_signalling(&mut chain, 3, 4, |_| false);
+    assert_eq!(chain.height().unwrap(), 130);
+    assert_eq!(state_after(&chain), DeploymentState::LockedIn);
+    let tip = chain.tip().unwrap().hash;
+    assert_eq!(chain.rules_for_child_of(&tip).unwrap(), Rules::NONE);
+
+    // 高さ 131 は効く前の最後のブロック。金額付きのコミットメント出力と、
+    // 末尾 0x00 の署名と、同じブロックの中で親の出力を子が使う形を混ぜる。
+    let one = Amount::from_atomic(1).unwrap();
+    let change = coin_output.amount.checked_sub(Amount::ONE_OAG).unwrap();
+    let mut parent = pay(
+        &key,
+        coin,
+        &coin_output,
+        vec![TxOutput::new(change, lock.clone()), note(one)],
+    );
+    parent.inputs[0].signature.push(0x00);
+    let parent_pay = OutPoint::new(parent.txid(), 0);
+    let old_note = OutPoint::new(parent.txid(), 1);
+    let child = pay(
+        &key,
+        parent_pay,
+        &parent.outputs[0],
+        vec![TxOutput::new(
+            change.checked_sub(Amount::ONE_OAG).unwrap(),
+            lock.clone(),
+        )],
+    );
+    let child_out = OutPoint::new(child.txid(), 0);
+    let child_output = child.outputs[0].clone();
+    let (_, outcome) =
+        push_with_version(&mut chain, tip, 131, SIGNAL, vec![parent, child]).unwrap();
+    assert_eq!(outcome, AcceptOutcome::ExtendedTip);
+    assert_eq!(chain.height().unwrap(), 131);
+    assert!(!in_utxo(&chain, &coin));
+    assert!(!in_utxo(&chain, &parent_pay), "spent in the same block");
+    assert!(in_utxo(&chain, &child_out));
+    assert!(
+        in_utxo(&chain, &old_note),
+        "before activation a commitment is just an unknown version"
+    );
+
+    // ここから規則が効く。印はもう付けない。
+    assert_eq!(state_after(&chain), DeploymentState::Active);
+    let tip = chain.tip().unwrap().hash;
+    assert_eq!(chain.rules_for_child_of(&tip).unwrap(), Rules::ALL);
+    assert_eq!(chain.block_version_for_child_of(&tip).unwrap(), 0);
+
+    // 末尾 0x00 の署名は無効。
+    let mut padded = pay(
+        &key,
+        child_out,
+        &child_output,
+        vec![TxOutput::new(Amount::ONE_OAG, lock.clone())],
+    );
+    padded.inputs[0].signature.push(0x00);
+    let bad = push_with_version(&mut chain, tip, 132, 0, vec![padded]);
+    assert!(bad.is_ok(), "an invalid block is recorded, not an error");
+    assert_eq!(chain.tip().unwrap().hash, tip, "the tip did not move");
+
+    // 金額付きのコミットメント出力も無効。
+    let costly = pay(
+        &key,
+        child_out,
+        &child_output,
+        vec![TxOutput::new(Amount::ONE_OAG, lock.clone()), note(one)],
+    );
+    let _ = push_with_version(&mut chain, tip, 133, 0, vec![costly]);
+    assert_eq!(chain.tip().unwrap().hash, tip, "the tip did not move");
+
+    // 金額 0 のコミットメント出力は通るが、UTXO には入らない。同じ
+    // ブロックの中で使おうとする取引は、無いものを使うので無効になる。
+    let maker = pay(
+        &key,
+        child_out,
+        &child_output,
+        vec![
+            TxOutput::new(Amount::ONE_OAG, lock.clone()),
+            note(Amount::ZERO),
+        ],
+    );
+    let new_note = OutPoint::new(maker.txid(), 1);
+    let taker = pay(
+        &key,
+        new_note,
+        &maker.outputs[1],
+        vec![TxOutput::new(Amount::ZERO, lock.clone())],
+    );
+    let _ = push_with_version(&mut chain, tip, 134, 0, vec![maker.clone(), taker]);
+    assert_eq!(chain.tip().unwrap().hash, tip, "the tip did not move");
+
+    let made = pay(
+        &key,
+        child_out,
+        &child_output,
+        vec![
+            TxOutput::new(Amount::ONE_OAG, lock.clone()),
+            note(Amount::ZERO),
+        ],
+    );
+    let made_note = OutPoint::new(made.txid(), 1);
+    let made_pay = OutPoint::new(made.txid(), 0);
+    let (_, outcome) = push_with_version(&mut chain, tip, 135, 0, vec![made]).unwrap();
+    assert_eq!(outcome, AcceptOutcome::ExtendedTip);
+    assert!(!in_utxo(&chain, &made_note), "a commitment is not a coin");
+    assert!(in_utxo(&chain, &made_pay));
+
+    // 効く前に作られたコミットメント出力は、そのまま誰でも使える。
+    let tip = chain.tip().unwrap().hash;
+    let sweep = Transaction {
+        version: CURRENT_TX_VERSION,
+        inputs: vec![TxInput::new(old_note)],
+        outputs: vec![TxOutput::new(one, lock)],
+        locktime: 0,
+    };
+    let (_, outcome) = push_with_version(&mut chain, tip, 136, 0, vec![sweep]).unwrap();
+    assert_eq!(outcome, AcceptOutcome::ExtendedTip);
+    assert!(!in_utxo(&chain, &old_note));
+}
+
+/// 閾値に届かなければ有効にならず、期限で `Failed` になって二度と戻らないこと。
+pub fn too_few_signals_time_out<S: ChainStore>(store: S) {
+    let deployment = Deployment {
+        timeout_height: 132,
+        ..TEST_DEPLOYMENT
+    };
+    let mut chain = open_signalled(store, deployment);
+    extend_signalling(&mut chain, 123, 1, |_| false);
+    assert_eq!(state_after(&chain), DeploymentState::Started);
+
+    // 124〜127 は 2 個だけ。閾値に 1 足りない。
+    extend_signalling(&mut chain, 4, 2, |h| h % 2 == 0);
+    assert_eq!(state_after(&chain), DeploymentState::Started);
+
+    // 128〜131 も 2 個。次の区切り (132) は期限なので失敗。
+    extend_signalling(&mut chain, 4, 3, |h| h % 2 == 0);
+    assert_eq!(state_after(&chain), DeploymentState::Failed);
+
+    // その後に全員が印を付けても戻らない。印を付けるよう求めることもない。
+    extend_signalling(&mut chain, 8, 4, |_| true);
+    assert_eq!(state_after(&chain), DeploymentState::Failed);
+    let tip = chain.tip().unwrap().hash;
+    assert_eq!(chain.block_version_for_child_of(&tip).unwrap(), 0);
+    assert_eq!(chain.rules_for_child_of(&tip).unwrap(), Rules::NONE);
+}
+
+/// 有効化の境目をまたぐリオーグで、それぞれの枝の規則に従うこと。
+///
+/// 本線は印を付けて規則が効き、効いた後のブロックで 0.4.3 と同じ形の
+/// 取引とコミットメント出力を持つ。脇の枝は印を付けず、規則が効かない
+/// まま、同じコインで金額付きのコミットメント出力を作る。
+///
+/// 脇の枝が重くなって切り替わり、また本線が重くなって戻る。最後の UTXO が、
+/// 本線だけを直接積んだものと一致することを確かめる。
+pub fn a_reorg_across_the_activation_follows_each_branch<S: ChainStore>(
+    forked_store: S,
+    direct_store: S,
+) {
+    let mut forked = open_signalled(forked_store, TEST_DEPLOYMENT);
+    let (key, coin, coin_output) = fund_at_height_one(&mut forked);
+    let lock = Lock::pay_to_pubkey(&key.public_key());
+    extend_signalling(&mut forked, 122, 1, |_| false);
+    assert_eq!(forked.height().unwrap(), 123);
+    let fork_point = forked.tip().unwrap().hash;
+
+    // ── 本線: 124〜131 は全部印。132 から規則が効く ──
+    extend_signalling(&mut forked, 8, 2, |_| true);
+    assert_eq!(state_after(&forked), DeploymentState::Active);
+
+    let change = coin_output.amount.checked_sub(Amount::ONE_OAG).unwrap();
+    let main_parent = pay(
+        &key,
+        coin,
+        &coin_output,
+        vec![TxOutput::new(change, lock.clone()), note(Amount::ZERO)],
+    );
+    let main_pay = OutPoint::new(main_parent.txid(), 0);
+    let main_note = OutPoint::new(main_parent.txid(), 1);
+    let main_child = pay(
+        &key,
+        main_pay,
+        &main_parent.outputs[0],
+        vec![TxOutput::new(
+            change.checked_sub(Amount::ONE_OAG).unwrap(),
+            lock.clone(),
+        )],
+    );
+    let main_child_out = OutPoint::new(main_child.txid(), 0);
+    let tip = forked.tip().unwrap().hash;
+    push_with_version(&mut forked, tip, 132, 0, vec![main_parent, main_child]).unwrap();
+    extend_signalling(&mut forked, 1, 3, |_| false);
+    assert_eq!(forked.height().unwrap(), 133);
+    let main_tip = forked.tip().unwrap().hash;
+    assert!(!in_utxo(&forked, &coin));
+    assert!(!in_utxo(&forked, &main_note));
+    assert!(in_utxo(&forked, &main_child_out));
+
+    // ── 脇の枝: 印を付けない。11 個積んで本線 (10 個) を上回る ──
+    let one = Amount::from_atomic(1).unwrap();
+    let side_parent = pay(
+        &key,
+        coin,
+        &coin_output,
+        vec![TxOutput::new(change, lock.clone()), note(one)],
+    );
+    let side_pay = OutPoint::new(side_parent.txid(), 0);
+    let side_note = OutPoint::new(side_parent.txid(), 1);
+    let side_child = pay(
+        &key,
+        side_pay,
+        &side_parent.outputs[0],
+        vec![TxOutput::new(
+            change.checked_sub(Amount::ONE_OAG).unwrap(),
+            lock.clone(),
+        )],
+    );
+    let side_child_out = OutPoint::new(side_child.txid(), 0);
+    let mut parent = fork_point;
+    let mut side_txs = Some(vec![side_parent, side_child]);
+    let mut last = None;
+    for i in 0..11u64 {
+        let height = 124 + i;
+        let extra = if height == 132 {
+            side_txs.take().unwrap()
+        } else {
+            vec![]
+        };
+        let (block, outcome) = push_with_version(&mut forked, parent, 9_000 + i, 0, extra).unwrap();
+        parent = block.header.hash();
+        last = Some(outcome);
+    }
+    match last.unwrap() {
+        AcceptOutcome::Reorganized(reorg) => assert_eq!(reorg.depth(), 10),
+        other => panic!("it did not reorg: {other:?}"),
+    }
+    assert_eq!(forked.height().unwrap(), 134);
+    assert_eq!(state_after(&forked), DeploymentState::Started);
+    let tip = forked.tip().unwrap().hash;
+    assert_eq!(forked.rules_for_child_of(&tip).unwrap(), Rules::NONE);
+    assert!(!in_utxo(&forked, &coin));
+    assert!(
+        !in_utxo(&forked, &main_child_out),
+        "the main branch was undone"
+    );
+    assert!(!in_utxo(&forked, &side_pay), "spent in the same block");
+    assert!(in_utxo(&forked, &side_child_out));
+    assert!(
+        in_utxo(&forked, &side_note),
+        "without activation a commitment is just an unknown version"
+    );
+
+    // ── 本線を 2 個伸ばして (12 個) 戻す ──
+    let (block, _) = push_with_version(&mut forked, main_tip, 777, 0, vec![]).unwrap();
+    let (_, outcome) = push_with_version(&mut forked, block.header.hash(), 778, 0, vec![]).unwrap();
+    match outcome {
+        AcceptOutcome::Reorganized(reorg) => assert_eq!(reorg.depth(), 11),
+        other => panic!("it did not reorg back: {other:?}"),
+    }
+    assert_eq!(forked.height().unwrap(), 135);
+    assert_eq!(state_after(&forked), DeploymentState::Active);
+    assert!(!in_utxo(&forked, &side_note), "the side branch was undone");
+    assert!(!in_utxo(&forked, &side_child_out));
+    assert!(!in_utxo(&forked, &main_note));
+    assert!(in_utxo(&forked, &main_child_out));
+
+    // ── 本線だけを直接積んだものと比べる ──
+    let mut direct = open_signalled(direct_store, TEST_DEPLOYMENT);
+    let mut path = Vec::new();
+    let mut cursor = forked.tip().unwrap().hash;
+    while let Some(entry) = forked.entry(&cursor).unwrap() {
+        if entry.height() == 0 {
+            break;
+        }
+        path.push(cursor);
+        cursor = entry.prev_hash();
+    }
+    path.reverse();
+    for hash in &path {
+        let block = forked.store().block(hash).unwrap().expect("held");
+        direct.accept_block(block, &AcceptAnyPow, NOW).unwrap();
+    }
+    assert_eq!(direct.tip().unwrap().hash, forked.tip().unwrap().hash);
+    assert_eq!(
+        direct.store().utxo_count().unwrap(),
+        forked.store().utxo_count().unwrap(),
+        "the UTXO after two reorgs differs from a direct build"
+    );
+    for outpoint in [
+        coin,
+        main_pay,
+        main_note,
+        main_child_out,
+        side_pay,
+        side_note,
+        side_child_out,
+    ] {
+        assert_eq!(
+            in_utxo(&direct, &outpoint),
+            in_utxo(&forked, &outpoint),
+            "{outpoint:?} disagrees"
+        );
+    }
+}
+
+/// 有効化の状態は、ヘッダだけから決まること。
+///
+/// headers-first の同期では、本体が届く前にヘッダが先まで伸びる。その
+/// 時点でも、本体を全部持っているチェーンと同じ答えを返さなければならない。
+pub fn the_activation_state_needs_only_headers<S: ChainStore>(full_store: S, header_store: S) {
+    let mut full = open_signalled(full_store, TEST_DEPLOYMENT);
+    let blocks = extend_signalling(&mut full, 140, 1, |h| (124..132).contains(&h));
+    let mut headers = open_signalled(header_store, TEST_DEPLOYMENT);
+    for block in &blocks {
+        assert_eq!(
+            headers
+                .accept_header(&block.header, &AcceptAnyPow, NOW)
+                .unwrap(),
+            HeaderOutcome::New
+        );
+        let hash = block.header.hash();
+        assert_eq!(
+            headers.deployment_state_for_child_of(&hash).unwrap(),
+            full.deployment_state_for_child_of(&hash).unwrap(),
+            "at height {}",
+            block.header.height
+        );
+    }
+    assert_eq!(headers.height().unwrap(), 0, "no body was connected");
+    let last = blocks.last().unwrap().header.hash();
+    assert_eq!(
+        headers.deployment_state_for_child_of(&last).unwrap(),
+        DeploymentState::Active
+    );
+}
+
+// ━━━━━━━━ 軽い枝を記憶域に書かない (SPEC §10.5) ━━━━━━━━
+
+/// 最良のヘッダより [`ANTI_DOS_BLOCKS`](crate::chain::ANTI_DOS_BLOCKS) ぶん
+/// 以上軽い枝のヘッダは、書かずに手元に置かれること。続きが重くなったら、
+/// そのとき祖先ごと書かれること。軽い枝の本体は書かれないこと。
+pub fn light_branch_headers_wait_in_memory_until_heavy<S: ChainStore>(store: S) {
+    let mut chain = open(store);
+    let genesis_hash = chain.tip().unwrap().hash;
+    let main = extend(&mut chain, genesis_hash, 200, 1);
+    assert_eq!(chain.height().unwrap(), 200);
+    let indexed = chain.indexed_blocks().unwrap();
+
+    // 難易度は 1 のまま。累積作業量は高さ + 1、閾値は 201 − 144 = 57。
+    // 高さ 10 から分岐させると、高さ 55 までは閾値に届かない。
+    let mut parent = main[9];
+    let mut fork = Vec::new();
+    for height in 11..=55u64 {
+        let block = build_on(&chain, parent, 50_000 + height);
+        parent = block.header.hash();
+        assert_eq!(
+            chain
+                .accept_header(&block.header, &AcceptAnyPow, NOW)
+                .unwrap(),
+            HeaderOutcome::Pending,
+            "at height {height}"
+        );
+        fork.push(block);
+    }
+    assert_eq!(chain.pending_headers(), 45);
+    assert_eq!(chain.indexed_blocks().unwrap(), indexed, "nothing written");
+    // 知ってはいる。
+    assert!(chain.contains(&fork[0].header.hash()).unwrap());
+    // 送り直されても重ねて置かない。
+    assert_eq!(
+        chain
+            .accept_header(&fork[3].header, &AcceptAnyPow, NOW)
+            .unwrap(),
+        HeaderOutcome::Known
+    );
+
+    // 軽い枝の本体は書かない。
+    let body = fork[20].clone();
+    let body_hash = body.header.hash();
+    assert_eq!(
+        chain.accept_block(body, &AcceptAnyPow, NOW).unwrap(),
+        AcceptOutcome::SideChain
+    );
+    assert!(chain.store().block(&body_hash).unwrap().is_none());
+    assert_eq!(chain.indexed_blocks().unwrap(), indexed);
+
+    // 高さ 56 で閾値に届く。祖先 45 個もまとめて書かれる。
+    let block = build_on(&chain, parent, 50_056);
+    assert_eq!(
+        chain
+            .accept_header(&block.header, &AcceptAnyPow, NOW)
+            .unwrap(),
+        HeaderOutcome::New
+    );
+    assert_eq!(chain.pending_headers(), 0);
+    assert_eq!(chain.indexed_blocks().unwrap(), indexed + 46);
+    assert_eq!(chain.tip().unwrap().hash, *main.last().unwrap(), "no reorg");
+}
+
+/// どれほど深く分岐した枝でも、重くなれば切り替わること。
+///
+/// リオーグの深さに上限は無い (SPEC §10.6)。軽いうちは本体を捨てるが、
+/// 重くなった時点でヘッダが書かれ、捨てた本体は取り寄せ直せる。
+pub fn a_deep_but_heavier_branch_still_wins<S: ChainStore>(store: S) {
+    let mut chain = open(store);
+    let genesis_hash = chain.tip().unwrap().hash;
+    let main = extend(&mut chain, genesis_hash, 200, 1);
+
+    // 高さ 10 から分岐し、本線より 1 つ長い枝を本体ごと届ける。
+    let mut parent = main[9];
+    let mut fork = Vec::new();
+    for height in 11..=201u64 {
+        let block = build_on(&chain, parent, 70_000 + height);
+        parent = block.header.hash();
+        fork.push(block.clone());
+        chain.accept_block(block, &AcceptAnyPow, NOW).unwrap();
+    }
+    // 軽いうちに届いた本体は捨てたので、まだ切り替われない。
+    assert_eq!(chain.tip().unwrap().hash, *main.last().unwrap());
+    let missing = chain.missing_bodies(1_000).unwrap();
+    assert!(
+        !missing.is_empty(),
+        "the dropped bodies are asked for again"
+    );
+
+    // 取り寄せ直した本体を届けると、切り替わる。
+    for hash in missing {
+        let block = fork
+            .iter()
+            .find(|b| b.header.hash() == hash)
+            .unwrap()
+            .clone();
+        chain.accept_block(block, &AcceptAnyPow, NOW).unwrap();
+    }
+    assert_eq!(chain.tip().unwrap().hash, parent);
+    assert_eq!(chain.height().unwrap(), 201);
 }

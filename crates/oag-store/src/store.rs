@@ -9,7 +9,7 @@ use oag_consensus::tx::TxOutput;
 use oag_consensus::utxo::{
     apply_block_to, undo_block_from, UndoBlock, UtxoEntry, UtxoError, UtxoView, UtxoWrite,
 };
-use oag_consensus::{Block, BlockHeader, Transaction};
+use oag_consensus::{Block, BlockHeader, Rules, Transaction};
 use oag_primitives::hash::HASH_LEN;
 use oag_primitives::Hash;
 use redb::{Database, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition};
@@ -363,6 +363,13 @@ fn index_keys(block: &Block, undo: &UndoBlock, height: u64) -> Result<IndexKeys,
         tx_keys.push(txindex::key(txindex::tx_prefix(&txid), height, position)?);
 
         for output in &tx.outputs {
+            // コミットメント出力は誰の支払いでもない。アドレスとして引く
+            // 意味が無いので載せない (SPEC §7.7)。**有効化の前後を問わず
+            // 版数だけで決める。** 接続・切断・作り直しのどれでも同じ鍵が
+            // 出るようにするためで、ここは合意の規則ではない。
+            if output.lock.is_commitment() {
+                continue;
+            }
             addr_keys.push(txindex::key(
                 txindex::lock_prefix(&output.lock),
                 height,
@@ -376,6 +383,9 @@ fn index_keys(block: &Block, undo: &UndoBlock, height: u64) -> Result<IndexKeys,
             else {
                 continue;
             };
+            if lock.is_commitment() {
+                continue;
+            }
             addr_keys.push(txindex::key(txindex::lock_prefix(lock), height, position)?);
         }
     }
@@ -1055,7 +1065,10 @@ impl Store {
     /// すべて反映されるか、まったく反映されないかのどちらかになる。
     ///
     /// 呼び出し側は事前に検証を済ませていなければならない。
-    pub fn connect_block(&self, block: &Block) -> Result<UndoBlock, StoreError> {
+    ///
+    /// `rules` は、そのブロックを検証したときと同じものを渡す
+    /// ([`apply_block_to`])。
+    pub fn connect_block(&self, block: &Block, rules: Rules) -> Result<UndoBlock, StoreError> {
         let hash = block.header.hash();
         let height = block.header.height;
         let txn = self.db.begin_write().map_err(db_err)?;
@@ -1065,7 +1078,7 @@ impl Store {
             let mut utxo = TableUtxo {
                 table: &mut utxo_table,
             };
-            apply_block_to(&mut utxo, &block.transactions, height)?
+            apply_block_to(&mut utxo, &block.transactions, height, rules)?
         };
 
         let indexed = {
@@ -1597,8 +1610,8 @@ impl oag_chain::store::ChainStore for Store {
         Store::put_index_entry(self, entry)
     }
 
-    fn connect_block(&self, block: &Block) -> Result<UndoBlock, StoreError> {
-        Store::connect_block(self, block)
+    fn connect_block(&self, block: &Block, rules: Rules) -> Result<UndoBlock, StoreError> {
+        Store::connect_block(self, block, rules)
     }
 
     fn disconnect_tip(&self) -> Result<Hash, StoreError> {
@@ -1708,7 +1721,7 @@ mod tests {
             store
                 .put_block(&block, &entry_for(&block, u128::from(height) + 1))
                 .unwrap();
-            store.connect_block(&block).unwrap();
+            store.connect_block(&block, Rules::NONE).unwrap();
             blocks.push(block);
         }
         blocks
@@ -1879,7 +1892,7 @@ mod tests {
             store
                 .put_block(&block, &entry_for(&block, u128::from(height) + 1))
                 .unwrap();
-            store.connect_block(&block).unwrap();
+            store.connect_block(&block, Rules::NONE).unwrap();
         }
         assert_eq!(store.utxo_count().unwrap(), 5);
 
@@ -1961,7 +1974,7 @@ mod tests {
         let mut memory = UtxoSet::new();
         for block in &blocks {
             memory
-                .apply_block(&block.transactions, block.header.height)
+                .apply_block(&block.transactions, block.header.height, Rules::NONE)
                 .unwrap();
         }
 
@@ -1984,7 +1997,7 @@ mod tests {
         let mut memory2 = UtxoSet::new();
         for block in &blocks[..blocks.len() - 1] {
             memory2
-                .apply_block(&block.transactions, block.header.height)
+                .apply_block(&block.transactions, block.header.height, Rules::NONE)
                 .unwrap();
         }
         assert_eq!(store.utxo_count().unwrap(), memory2.len() as u64);
@@ -2020,7 +2033,7 @@ mod tests {
             locktime: 0,
         });
 
-        assert!(store.connect_block(&bad).is_err());
+        assert!(store.connect_block(&bad, Rules::NONE).is_err());
         assert_eq!(store.tip().unwrap(), tip_before, "the tip has moved");
         assert_eq!(store.height().unwrap(), height_before);
         assert_eq!(
@@ -2148,7 +2161,7 @@ mod tests {
 
     fn put_and_connect(store: &Store, block: &Block) {
         store.put_block(block, &entry_for(block, 1)).unwrap();
-        store.connect_block(block).unwrap();
+        store.connect_block(block, Rules::NONE).unwrap();
     }
 
     #[test]
@@ -2338,6 +2351,53 @@ mod tests {
         assert_eq!(history[0].txid, second.transactions[1].txid());
     }
 
+    /// コミットメント出力は住所の索引に載らず、UTXO にも入らないこと。
+    /// 接続・切断・作り直しのどれでも、索引にごみが残らないこと。
+    #[test]
+    fn a_commitment_stays_out_of_the_address_index_and_the_utxo() {
+        let tmp = TempDb::new();
+        let store = tmp.open();
+        let payer = Lock::pay_to_pubkey(&SecretKey::generate().public_key());
+        let note = Lock::commitment(b"orange".to_vec()).unwrap();
+
+        let first = block_with(0, Hash::ZERO, &payer, Vec::new());
+        put_and_connect(&store, &first);
+        store.build_index().unwrap();
+
+        let spent = OutPoint::new(first.transactions[0].txid(), 0);
+        let mut tx = spend(spent, &payer);
+        tx.outputs.push(TxOutput::new(Amount::ZERO, note.clone()));
+        let note_out = OutPoint::new(tx.txid(), 1);
+        let mut second = block_with(1, first.header.hash(), &payer, vec![tx]);
+        // コインベースにも 1 つ置く。
+        second.transactions[0]
+            .outputs
+            .push(TxOutput::new(Amount::ZERO, note.clone()));
+        let ids: Vec<Hash> = second.transactions.iter().map(|t| t.txid()).collect();
+        second.header.merkle_root = merkle::merkle_root(&ids).unwrap();
+        store.put_block(&second, &entry_for(&second, 1)).unwrap();
+        let before = store.utxo_count().unwrap();
+        store.connect_block(&second, Rules::ALL).unwrap();
+
+        assert!(store.address_history(&note, 0, 100).unwrap().is_empty());
+        assert!(!store.utxo_view().unwrap().contains(&note_out).unwrap());
+        // 使った 1 つが消え、支払い 2 つ (コインベースと取引) が増える。
+        assert_eq!(store.utxo_count().unwrap(), before + 1);
+        assert_eq!(store.address_history(&payer, 0, 100).unwrap().len(), 3);
+
+        // 作り直しても同じ。
+        store.drop_index().unwrap();
+        store.build_index().unwrap();
+        assert!(store.address_history(&note, 0, 100).unwrap().is_empty());
+        assert_eq!(store.address_history(&payer, 0, 100).unwrap().len(), 3);
+
+        // 切断すると、索引も UTXO も元どおりになる。
+        store.disconnect_tip().unwrap();
+        assert_eq!(store.utxo_count().unwrap(), before);
+        assert_eq!(store.address_history(&payer, 0, 100).unwrap().len(), 1);
+        assert!(store.address_history(&note, 0, 100).unwrap().is_empty());
+    }
+
     #[test]
     fn address_history_can_start_partway_and_stop_early() {
         let tmp = TempDb::new();
@@ -2464,7 +2524,7 @@ mod storage_shape_tests {
 
         // 戻した分を繋ぎ直すと元に戻る。
         for block in blocks.iter().skip(9) {
-            store.connect_block(block).unwrap();
+            store.connect_block(block, Rules::NONE).unwrap();
         }
         assert_eq!(store.height().unwrap(), Some(11));
         assert_eq!(store.utxo_count().unwrap(), before);
@@ -2619,7 +2679,7 @@ mod storage_shape_tests {
                 store
                     .put_block(&block, &entry_for(&block, u128::from(height) + 1))
                     .unwrap();
-                store.connect_block(&block).unwrap();
+                store.connect_block(&block, Rules::NONE).unwrap();
             }
             assert_eq!(
                 store.blocks_from().unwrap(),
@@ -2643,7 +2703,7 @@ mod storage_shape_tests {
         assert_eq!(store.tip().unwrap().unwrap(), blocks[10].header.hash());
         // 戻した先の本体は読める。再接続に要る。
         assert!(store.block(&blocks[11].header.hash()).unwrap().is_some());
-        store.connect_block(&blocks[11]).unwrap();
+        store.connect_block(&blocks[11], Rules::NONE).unwrap();
         assert_eq!(store.tip().unwrap().unwrap(), tip);
     }
 

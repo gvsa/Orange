@@ -201,6 +201,7 @@ mod tests {
     fn template(difficulty: u64) -> BlockTemplate {
         let request = TemplateRequest {
             prev_hash: hash::block_hash(b"parent"),
+            version: oag_consensus::block::CURRENT_BLOCK_VERSION,
             height: 500,
             difficulty,
             timestamp: 1_800_000_000,

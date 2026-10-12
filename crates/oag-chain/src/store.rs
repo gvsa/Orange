@@ -13,7 +13,7 @@
 
 use crate::index::BlockIndexEntry;
 use oag_consensus::utxo::{UndoBlock, UtxoSet, UtxoView};
-use oag_consensus::Block;
+use oag_consensus::{Block, Rules};
 use oag_primitives::Hash;
 use std::collections::HashMap;
 
@@ -92,7 +92,10 @@ pub trait ChainStore {
     fn put_index_entry(&self, entry: &BlockIndexEntry) -> Result<(), Self::Error>;
 
     /// ブロックをアクティブチェーンに接続する。検証は呼び出し側の責任である。
-    fn connect_block(&self, block: &Block) -> Result<UndoBlock, Self::Error>;
+    ///
+    /// `rules` は、そのブロックを検証したときと同じものを渡す
+    /// ([`apply_block_to`](oag_consensus::utxo::apply_block_to))。
+    fn connect_block(&self, block: &Block, rules: Rules) -> Result<UndoBlock, Self::Error>;
 
     /// 先端のブロックを取り消す。
     fn disconnect_tip(&self) -> Result<Hash, Self::Error>;
@@ -242,12 +245,12 @@ impl ChainStore for MemoryStore {
             .unwrap_or_default())
     }
 
-    fn connect_block(&self, block: &Block) -> Result<UndoBlock, Self::Error> {
+    fn connect_block(&self, block: &Block, rules: Rules) -> Result<UndoBlock, Self::Error> {
         let mut inner = self.inner.borrow_mut();
         // UtxoSet::apply_block は失敗時に変更を残さない。
         let undo = inner
             .utxo
-            .apply_block(&block.transactions, block.header.height)?;
+            .apply_block(&block.transactions, block.header.height, rules)?;
         let hash = block.header.hash();
         inner.undo.insert(hash, undo.clone());
         inner.active.push(hash);

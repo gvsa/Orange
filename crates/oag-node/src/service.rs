@@ -40,7 +40,7 @@ use oag_pow::randomx::{RandomXVerifier, SharedDataset};
 use oag_primitives::{Amount, Hash, Network};
 use oag_store::{BlockSummary, IndexStats, TxLocation};
 use std::collections::{BTreeMap, VecDeque};
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::num::NonZeroUsize;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -218,13 +218,25 @@ pub struct BlockAccepted {
 }
 
 /// ヘッダの列を受け取った結果。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HeadersAccepted {
     /// 初めて見たヘッダの数。
     pub new: usize,
+    /// 正しいが、枝の作業量が足りないので書かずに手元に置いた数
+    /// ([`oag_chain::chain::ANTI_DOS_BLOCKS`])。
+    pub pending: usize,
     /// 受け取ったヘッダの総数。
     pub total: usize,
+    /// 不正なヘッダが混ざっていた。その理由。
+    ///
+    /// **送ってきた相手は切って、しばらく出入りを禁じる** (SPEC §10.5)。
+    /// 記憶域が読めなかった、親を知らない、といった相手のせいではない
+    /// 失敗はここに入らず、`Err` で返る。
+    pub invalid: Option<String>,
 }
+
+/// 悪さをした相手を出入り禁止にする時間 (秒)。Bitcoin Core と同じ 24 時間。
+pub const BAN_SECS: i64 = 24 * 60 * 60;
 
 /// 外の採掘器に配る仕事の土台 ([`NodeHandle::mining_job`])。
 #[derive(Debug, Clone)]
@@ -318,6 +330,16 @@ enum Request {
     },
     /// `getaddr` に返す住所を選ぶ。
     AddressesToShare(oneshot::Sender<Result<Vec<NetAddress>, String>>),
+    /// 悪さをした相手を出入り禁止にする。
+    Ban {
+        ip: IpAddr,
+        reason: String,
+    },
+    /// 出入り禁止にしている相手か。
+    IsBanned {
+        ip: IpAddr,
+        reply: oneshot::Sender<Result<bool, String>>,
+    },
     /// 次に繋ぎに行く候補を選ぶ。
     AddressCandidates {
         /// 欲しい件数。
@@ -708,6 +730,19 @@ impl NodeHandle {
             .await
     }
 
+    /// 悪さをした相手を [`BAN_SECS`] だけ出入り禁止にする。
+    ///
+    /// **自分の機械 (ループバック) は禁じない。** 同じ機械で動かしている
+    /// 道具や試験を締め出さないため。
+    pub async fn ban(&self, ip: IpAddr, reason: String) -> Result<(), String> {
+        self.tell(Request::Ban { ip, reason }).await
+    }
+
+    /// 出入り禁止にしている相手か。
+    pub async fn is_banned(&self, ip: IpAddr) -> Result<bool, String> {
+        self.ask(|reply| Request::IsBanned { ip, reply }).await
+    }
+
     /// 繋ぎに行った結果を記録する。
     pub async fn address_outcome(
         &self,
@@ -972,6 +1007,25 @@ struct Service {
     /// 初期同期で 1 ブロックずつ出すと数千行になる。追いつくまでは
     /// [`PROGRESS_EVERY`] ごとにまとめ、追いついたら 1 ブロックずつ出す。
     progress: Option<(Instant, u64)>,
+    /// 出入り禁止にしている相手と、解く時刻 (Unix 秒)。
+    ///
+    /// **メモリにしか持たない。** 再起動すれば解ける。禁じるのは、明らかに
+    /// 不正なものを送ってきた相手だけなので、それで足りる。
+    banned: std::collections::HashMap<IpAddr, i64>,
+}
+
+/// ヘッダを断った理由が、送ってきた相手のせいか。
+///
+/// PoW・難易度・時刻・無効な祖先は、正しいノードなら送らない。**記憶域が
+/// 読めない、親を知らない**のは相手のせいではない (知らないのは、こちらが
+/// 手元に置いていたヘッダを捨てた後かもしれない)。
+fn header_is_invalid(error: &NodeError) -> bool {
+    use oag_chain::ChainError;
+    match error {
+        NodeError::Chain(ChainError::Validation(e)) => !e.is_storage_failure(),
+        NodeError::Chain(ChainError::InvalidAncestor(_)) => true,
+        _ => false,
+    }
 }
 
 /// 追いついたとみなす差。これ以内なら 1 ブロックずつ記録に出す。
@@ -1090,6 +1144,7 @@ impl NodeService {
                     stale_template: true,
                     template_built: None,
                     progress: None,
+                    banned: std::collections::HashMap::new(),
                 }
                 .run(rx);
             })
@@ -1633,10 +1688,13 @@ impl Service {
                 } else {
                     oag_net::SERVICE_NONE
                 };
-                let picked = self
-                    .node
-                    .addresses()
-                    .candidates_offering(now(), want, &busy, require);
+                let mut picked =
+                    self.node
+                        .addresses()
+                        .candidates_offering(now(), want, &busy, require);
+                // 出入り禁止にしている相手には繋ぎに行かない。
+                let at = now();
+                picked.retain(|addr| !self.is_banned_at(addr.ip(), at));
                 // 繋ぎに行くと決めた時点で印を付ける。付けないと、
                 // 結果が返るまでの間に同じ住所をもう一度選んでしまう。
                 let at = now();
@@ -1644,6 +1702,20 @@ impl Service {
                     self.node.addresses_mut().mark_attempt(addr, at);
                 }
                 let _ = reply.send(Ok(picked));
+            }
+            Request::Ban { ip, reason } => {
+                if ip.is_loopback() {
+                    return;
+                }
+                let until = now() + BAN_SECS;
+                crate::log_warn!("banning {ip} for {BAN_SECS} seconds: {reason}");
+                self.banned.insert(ip, until);
+                // 溜まり続けないよう、期限の切れたものをついでに捨てる。
+                let at = now();
+                self.banned.retain(|_, until| *until > at);
+            }
+            Request::IsBanned { ip, reply } => {
+                let _ = reply.send(Ok(self.is_banned_at(ip, now())));
             }
             Request::AddressOutcome { addr, outcome } => {
                 let at = now();
@@ -1853,14 +1925,26 @@ impl Service {
             .map_err(|e| e.to_string())
     }
 
+    /// 出入り禁止にしているか。
+    fn is_banned_at(&self, ip: IpAddr, now: i64) -> bool {
+        self.banned.get(&ip).is_some_and(|until| *until > now)
+    }
+
     fn accept_headers(&mut self, headers: &[BlockHeader]) -> Result<HeadersAccepted, String> {
         let now = now();
         let mut new = 0;
+        let mut pending = 0;
+        let mut invalid = None;
         for header in headers {
             match self.node.accept_header(header, now) {
                 Ok(HeaderOutcome::New) => new += 1,
+                Ok(HeaderOutcome::Pending) => pending += 1,
                 Ok(HeaderOutcome::Known) => {}
                 // 1 個でも駄目なら、そこで止める。以降は繋がらない。
+                Err(e) if header_is_invalid(&e) => {
+                    invalid = Some(e.to_string());
+                    break;
+                }
                 Err(e) => return Err(e.to_string()),
             }
         }
@@ -1874,7 +1958,9 @@ impl Service {
 
         Ok(HeadersAccepted {
             new,
+            pending,
             total: headers.len(),
+            invalid,
         })
     }
 
@@ -2185,6 +2271,29 @@ impl Service {
 mod tests {
     use super::*;
 
+    #[test]
+    fn only_a_peer_s_own_faults_count_as_invalid_headers() {
+        use oag_chain::ChainError;
+        use oag_consensus::utxo::UtxoError;
+        use oag_consensus::ValidationError;
+        let invalid = |e: ChainError| header_is_invalid(&NodeError::Chain(e));
+        assert!(invalid(ChainError::Validation(
+            ValidationError::BadProofOfWork
+        )));
+        assert!(invalid(ChainError::Validation(
+            ValidationError::BadDifficulty {
+                actual: 1,
+                expected: 2
+            }
+        )));
+        assert!(invalid(ChainError::InvalidAncestor(Hash::ZERO)));
+        // 相手のせいではないもの。
+        assert!(!invalid(ChainError::UnknownParent(Hash::ZERO)));
+        assert!(!invalid(ChainError::Store("disk".to_string())));
+        assert!(!invalid(ChainError::Validation(ValidationError::Utxo(
+            UtxoError::Backend("disk".to_string())
+        ))));
+    }
     #[test]
     fn the_default_is_one_light_thread() {
         // **積んでいる memory を当てにしない。** 既定で 8 本建てると、

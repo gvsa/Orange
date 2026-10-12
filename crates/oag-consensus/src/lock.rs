@@ -11,7 +11,8 @@
 
 use crate::codec::{write_var_bytes, CodecError, Decode, Encode, Reader};
 use oag_primitives::address::{
-    AddressError, MAX_PAYLOAD_LEN, MAX_VERSION, MIN_PAYLOAD_LEN, PUBKEY_PAYLOAD_LEN, VERSION_PUBKEY,
+    AddressError, MAX_PAYLOAD_LEN, MAX_VERSION, MIN_PAYLOAD_LEN, PUBKEY_PAYLOAD_LEN,
+    VERSION_COMMITMENT, VERSION_PUBKEY,
 };
 use oag_primitives::{Address, Network, PublicKey};
 
@@ -74,6 +75,23 @@ impl Lock {
             version: VERSION_PUBKEY,
             payload: vec![0u8; PUBKEY_PAYLOAD_LEN],
         }
+    }
+
+    /// コミットメント出力の支払い条件 (版数 3、SPEC §7.7)。
+    ///
+    /// 中身は 2〜40 バイトである。**誰にも使えない**ので、金額は 0 に
+    /// しなければならない (有効化の後は合意の規則である)。
+    pub fn commitment(payload: Vec<u8>) -> Result<Lock, AddressError> {
+        Lock::new(VERSION_COMMITMENT, payload)
+    }
+
+    /// コミットメント出力か (版数 3)。
+    ///
+    /// 版数を見るだけである。規則が効くかどうかは、その出力が作られた
+    /// 時点でソフトフォークが有効だったかによる
+    /// ([`Rules::commitment_outputs`](crate::validate::Rules::commitment_outputs))。
+    pub fn is_commitment(&self) -> bool {
+        self.version == VERSION_COMMITMENT
     }
 
     /// アドレスから作る。
@@ -215,6 +233,30 @@ mod tests {
         assert_eq!(decoded, lock);
         assert!(!decoded.is_known_version());
         assert_eq!(decoded.to_pubkey(), None);
+    }
+
+    #[test]
+    fn a_commitment_carries_two_to_forty_bytes_and_is_not_payable() {
+        for len in [2usize, 32, 40] {
+            let lock = Lock::commitment(vec![0x5a; len]).unwrap();
+            assert!(lock.is_commitment());
+            assert_eq!(lock.version(), 3);
+            assert_eq!(lock.payload().len(), len);
+            // 支払い先ではない。ウォレットはこの版数へ送らない。
+            assert!(!lock.is_known_version());
+            assert_eq!(lock.to_pubkey(), None);
+            assert_eq!(Lock::decode(&lock.encode()).unwrap(), lock);
+        }
+        for len in [0usize, 1, 41] {
+            assert!(matches!(
+                Lock::commitment(vec![0x5a; len]),
+                Err(AddressError::PayloadLengthOutOfRange(n)) if n == len
+            ));
+        }
+        assert!(
+            !Lock::pay_to_pubkey(&oag_primitives::SecretKey::generate().public_key())
+                .is_commitment()
+        );
     }
 
     #[test]

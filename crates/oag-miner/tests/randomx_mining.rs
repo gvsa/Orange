@@ -24,6 +24,7 @@ const NOW: i64 = MTP + 3_600;
 fn request(difficulty: u64) -> TemplateRequest {
     TemplateRequest {
         prev_hash: hash::block_hash(b"parent"),
+        version: oag_consensus::block::CURRENT_BLOCK_VERSION,
         height: HEIGHT,
         difficulty,
         timestamp: NOW,
@@ -75,6 +76,7 @@ fn a_block_mined_with_randomx_passes_validation() {
         },
         utxo: &utxo,
         relative_locktime: None,
+        rules: oag_consensus::Rules::ALL,
     };
     validate_block(&block, &ctx, &AcceptAnyPow)
         .expect("the assembled block does not pass validation");

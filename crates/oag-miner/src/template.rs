@@ -95,6 +95,12 @@ pub struct TemplateRequest {
     pub height: u64,
     /// 難易度調整が定めた難易度。
     pub difficulty: u64,
+    /// ヘッダの `version`。
+    ///
+    /// ソフトフォークの印はここに付く (SPEC §10.9)。チェーンが答える値
+    /// (`Chain::block_version_for_child_of`) をそのまま渡すこと。
+    /// 自分で決めると、印が付かないか、付けてはいけない時期に付く。
+    pub version: u32,
     /// ブロックのタイムスタンプ。
     pub timestamp: i64,
     /// 報酬の受取先。
@@ -156,7 +162,7 @@ pub fn build_template(
 
     let template = BlockTemplate {
         header: BlockHeader {
-            version: oag_consensus::block::CURRENT_BLOCK_VERSION,
+            version: request.version,
             prev_hash: request.prev_hash,
             merkle_root,
             timestamp: request.timestamp,
@@ -256,6 +262,7 @@ mod tests {
     fn request() -> TemplateRequest {
         TemplateRequest {
             prev_hash: hash::block_hash(b"parent"),
+            version: oag_consensus::block::CURRENT_BLOCK_VERSION,
             height: HEIGHT,
             difficulty: DIFFICULTY,
             timestamp: NOW,
@@ -285,7 +292,14 @@ mod tests {
             let funds = fund(&mut utxo, "10", &[i]);
             let fee = format!("0.0{}", i + 1);
             mempool
-                .accept(spend(&funds, &fee), &utxo, HEIGHT, MTP, &TIMES)
+                .accept(
+                    spend(&funds, &fee),
+                    &utxo,
+                    HEIGHT,
+                    MTP,
+                    &TIMES,
+                    oag_consensus::Rules::ALL,
+                )
                 .unwrap();
             expected = expected.checked_add(fee.parse().unwrap()).unwrap();
         }
@@ -309,7 +323,14 @@ mod tests {
         for i in 0..4u8 {
             let funds = fund(&mut utxo, "10", &[i, 0xaa]);
             mempool
-                .accept(spend(&funds, "0.05"), &utxo, HEIGHT, MTP, &TIMES)
+                .accept(
+                    spend(&funds, "0.05"),
+                    &utxo,
+                    HEIGHT,
+                    MTP,
+                    &TIMES,
+                    oag_consensus::Rules::ALL,
+                )
                 .unwrap();
         }
 
@@ -327,6 +348,7 @@ mod tests {
             },
             utxo: &utxo,
             relative_locktime: Some(&TIMES),
+            rules: oag_consensus::Rules::ALL,
         };
         let summary = validate_block(&block, &ctx, &AcceptAnyPow)
             .expect("the assembled block does not pass validation");
@@ -387,7 +409,14 @@ mod tests {
         for i in 0..1_600u32 {
             let funds = fund(&mut utxo, "10", &i.to_le_bytes());
             mempool
-                .accept(spend(&funds, "0.01"), &utxo, HEIGHT, MTP, &TIMES)
+                .accept(
+                    spend(&funds, "0.01"),
+                    &utxo,
+                    HEIGHT,
+                    MTP,
+                    &TIMES,
+                    oag_consensus::Rules::ALL,
+                )
                 .unwrap();
         }
         assert_eq!(mempool.len(), 1_600, "the test's premise no longer holds");

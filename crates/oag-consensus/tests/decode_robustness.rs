@@ -213,11 +213,14 @@ fn a_corrupted_undo_record_never_panics_and_never_decodes_two_ways() {
     // 使用分と作成分の両方が入った巻き戻し情報を、実際に組み立てて得る。
     let mut utxo = UtxoSet::new();
     let cb = coinbase(1);
-    utxo.apply_block(std::slice::from_ref(&cb), 1).unwrap();
+    utxo.apply_block(std::slice::from_ref(&cb), 1, oag_consensus::Rules::NONE)
+        .unwrap();
 
     let mut spend = payment(9);
     spend.inputs[0].prev_out = OutPoint::new(cb.txid(), 0);
-    let undo = utxo.apply_block(&[coinbase(2), spend], 2).unwrap();
+    let undo = utxo
+        .apply_block(&[coinbase(2), spend], 2, oag_consensus::Rules::NONE)
+        .unwrap();
     assert!(undo.spent_count() > 0 && undo.created_count() > 0);
     let original = undo.encode();
     let mut rng = Rng::new(0x0A6E_0004);

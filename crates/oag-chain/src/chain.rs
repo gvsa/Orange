@@ -29,16 +29,19 @@
 
 use crate::index::{BlockIndex, BlockIndexEntry, BlockStatus, EntryCache};
 use crate::store::ChainStore;
+use oag_consensus::block::CURRENT_BLOCK_VERSION;
+use oag_consensus::deployment::{Activation, DeploymentState};
 use oag_consensus::params;
 use oag_consensus::utxo::UtxoError;
 use oag_consensus::validate::{
     median_time_past, validate_block, validate_header, AcceptAnyPow, BlockContext, ChainTimes,
-    HeaderContext, PowVerifier, SignatureChecks, ValidationError,
+    HeaderContext, PowVerifier, Rules, SignatureChecks, ValidationError,
 };
 use oag_consensus::{Block, BlockHeader};
 use oag_pow::lwma::{self, LwmaError};
 use oag_primitives::Hash;
 use std::cell::RefCell;
+use std::collections::HashMap;
 
 /// 難易度調整を行うか。
 ///
@@ -64,7 +67,40 @@ pub enum HeaderOutcome {
     New,
     /// すでに知っていた。
     Known,
+    /// 正しいヘッダだが、その枝の作業量が足りないので、まだ記憶域に
+    /// 書かずに手元に置いた ([`ANTI_DOS_BLOCKS`])。
+    ///
+    /// 続きが届いて作業量が足りれば、そのとき祖先ごと書く。
+    Pending,
 }
+
+/// 最良のヘッダから、このブロック数ぶんの作業量より軽い枝は記憶域に
+/// 書かない (`docs/SPEC.md` §10.5)。
+///
+/// # なぜ要るのか
+///
+/// ヘッダ 1 つを作るのに要る作業量は、その高さの難易度で決まる。
+/// **難易度の低かった昔の高さから分岐させれば、正しいヘッダを安く大量に
+/// 作れる。** 検証を通ったものを全部書いていると、それでディスクを
+/// 埋められる。
+///
+/// # どう塞ぐか
+///
+/// Bitcoin Core の anti-DoS の閾値と同じ考え方である (144 ブロック)。
+/// 閾値より軽い枝のヘッダは、書かずに手元 (メモリ) に置く
+/// ([`MAX_PENDING_HEADERS`] まで)。続きが届いて閾値を超えたら、そのとき
+/// 祖先ごと書く。
+///
+/// **リオーグの深さに上限は設けない** (SPEC §10.6)。どれほど深く分岐した
+/// 枝でも、最良のヘッダに近づくほど作業量を積めば書かれる。書かないのは、
+/// まだ最良になれる見込みの無い枝だけである。
+pub const ANTI_DOS_BLOCKS: u128 = 144;
+
+/// 書かずに手元に置くヘッダの上限。
+///
+/// 1 件およそ 230 バイトなので 10 MB 強。超えたら全部捨てる。捨てられた
+/// 枝が本物なら、相手が送り直すまで繋がらないだけである。
+pub const MAX_PENDING_HEADERS: usize = 50_000;
 
 /// ブロックを受け取った結果。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -204,6 +240,21 @@ pub struct Chain<S: ChainStore> {
     assume_valid: RefCell<Option<AssumeValid>>,
     /// 相対 locktime の強制が始まる高さ (`docs/SPEC.md` §7.5)。
     relative_locktime_height: u64,
+    /// コミットメント出力などの規則 ([`Rules`]) の有効化のしかた
+    /// (`docs/SPEC.md` §10.9)。
+    commitment_activation: Activation,
+    /// 区切りごとの有効化の状態の控え。
+    ///
+    /// 鍵は**区切りの最後のブロックのハッシュ**で、値はその次の区切りの
+    /// 状態である。状態は祖先だけから決まるので、ハッシュに紐付けておけば
+    /// リオーグで枝が変わっても取り違えない。違う枝の区切りは違うハッシュに
+    /// なる。消す必要も無い (区切り 1 つにつき 1 件しか増えない)。
+    deployment_states: RefCell<HashMap<Hash, DeploymentState>>,
+    /// 作業量が足りず、まだ記憶域に書いていないヘッダ ([`ANTI_DOS_BLOCKS`])。
+    ///
+    /// **候補にも控えにも入れない。** [`Chain::entry`] が最後に引くだけで
+    /// ある。控えに入れると、捨てた後も「知っている」と答え続ける。
+    pending: RefCell<HashMap<Hash, BlockIndexEntry>>,
 }
 
 /// ある枝の上で、過去のブロックの Median Time Past を答える
@@ -285,7 +336,10 @@ impl<S: ChainStore> Chain<S> {
                     status: BlockStatus::FullyValid,
                 };
                 store.put_block(&genesis, &entry).map_err(Self::store_err)?;
-                store.connect_block(&genesis).map_err(Self::store_err)?;
+                // ジェネシスにソフトフォークの規則は効かない。
+                store
+                    .connect_block(&genesis, Rules::NONE)
+                    .map_err(Self::store_err)?;
                 index.record(&entry);
             }
             Some(tip_hash) => {
@@ -324,6 +378,9 @@ impl<S: ChainStore> Chain<S> {
             retarget,
             assume_valid: RefCell::new(None),
             relative_locktime_height: 0,
+            commitment_activation: Activation::Always,
+            deployment_states: RefCell::new(HashMap::new()),
+            pending: RefCell::new(HashMap::new()),
         })
     }
 
@@ -387,15 +444,60 @@ impl<S: ChainStore> Chain<S> {
     /// **`None` は「知らない」であって「読めなかった」ではない。**
     /// 読めなかったときは誤りを返す。この 2 つを混同すると、正しい
     /// ブロックを知らないものとして扱い、静かにチェーンから外れる。
+    ///
+    /// 作業量が足りずに手元に置いているヘッダ ([`HeaderOutcome::Pending`])
+    /// も答える。それは記憶域にも控えにも無い。
     pub fn entry(&self, hash: &Hash) -> Result<Option<BlockIndexEntry>, ChainError> {
         if let Some(entry) = self.entries.borrow().get(hash) {
             return Ok(Some(entry.clone()));
         }
         let Some(entry) = self.store.index_entry(hash).map_err(Self::store_err)? else {
-            return Ok(None);
+            return Ok(self.pending.borrow().get(hash).cloned());
         };
         self.entries.borrow_mut().put(entry.clone());
         Ok(Some(entry))
+    }
+
+    /// 書かずに手元に置いているヘッダの数。
+    pub fn pending_headers(&self) -> usize {
+        self.pending.borrow().len()
+    }
+
+    /// これより軽い枝は記憶域に書かない、という作業量 ([`ANTI_DOS_BLOCKS`])。
+    fn anti_dos_threshold(&self) -> Result<u128, ChainError> {
+        let best = self.best_header()?;
+        Ok(best
+            .cumulative_work
+            .saturating_sub(u128::from(best.header.difficulty) * ANTI_DOS_BLOCKS))
+    }
+
+    /// 手元に置く。上限を超えたら全部捨てる。
+    fn hold_pending(&self, entry: BlockIndexEntry) {
+        let mut pending = self.pending.borrow_mut();
+        if pending.len() >= MAX_PENDING_HEADERS {
+            pending.clear();
+        }
+        pending.insert(entry.hash, entry);
+    }
+
+    /// `from` から親をたどり、手元に置いていた祖先を古い順に記憶域へ書く。
+    ///
+    /// 子を書く前に呼ぶ。**祖先が記憶域に無いまま子だけ書くと、子から
+    /// 創世までたどれなくなる。**
+    fn flush_pending_ancestors(&mut self, from: &Hash) -> Result<(), ChainError> {
+        let mut chain = Vec::new();
+        let mut cursor = *from;
+        loop {
+            let Some(entry) = self.pending.borrow_mut().remove(&cursor) else {
+                break;
+            };
+            cursor = entry.prev_hash();
+            chain.push(entry);
+        }
+        for entry in chain.iter().rev() {
+            self.put_entry(entry)?;
+        }
+        Ok(())
     }
 
     /// 控えている件数。**上限で頭打ちになることを確かめるために公開する。**
@@ -517,6 +619,164 @@ impl<S: ChainStore> Chain<S> {
     /// 相対 locktime の強制が始まる高さ。
     pub fn relative_locktime_height(&self) -> u64 {
         self.relative_locktime_height
+    }
+
+    /// コミットメント出力などの規則の有効化のしかたを決める
+    /// (`docs/SPEC.md` §10.9)。
+    ///
+    /// **既定は [`Activation::Always`] (最初から有効) である。** ノードは
+    /// ネットワークごとの値
+    /// ([`commitment_activation`](oag_consensus::deployment::commitment_activation))
+    /// を必ず渡すこと。有効化より前の mainnet のブロックを、規則ありで
+    /// 検証してはならない。
+    pub fn set_commitment_activation(&mut self, activation: Activation) {
+        self.commitment_activation = activation;
+        self.deployment_states.borrow_mut().clear();
+    }
+
+    /// コミットメント出力などの規則の有効化のしかた。
+    pub fn commitment_activation(&self) -> Activation {
+        self.commitment_activation
+    }
+
+    /// `parent` を親とするブロックでの、有効化の状態 (BIP9)。
+    ///
+    /// 祖先のヘッダの `version` だけから決まる。本体は要らないので、
+    /// ヘッダだけ知っている枝にも答えられる。
+    ///
+    /// # 数え方
+    ///
+    /// 区切りの頭の高さを `P` とすると、区切り `P` の状態は、区切り
+    /// `P − period` の状態と、その区切り (高さ `P − period` から `P − 1`)
+    /// で印の付いたブロックの数で決まる
+    /// ([`Deployment::next_state`](oag_consensus::deployment::Deployment::next_state))。
+    /// 控えに無い区切りは、控えに当たるか、まだ数え始める前の区切りに
+    /// 着くまで遡り、古い順に決めて控えていく。
+    ///
+    /// 引けない祖先があれば記憶域の誤りとして返す。ブロックの誤りではない
+    /// ので、無効の印を付けさせない。
+    pub fn deployment_state_for_child_of(
+        &self,
+        parent: &Hash,
+    ) -> Result<DeploymentState, ChainError> {
+        let d = match self.commitment_activation {
+            Activation::Always => return Ok(DeploymentState::Active),
+            Activation::Never => return Ok(DeploymentState::Defined),
+            Activation::Signalled(d) => d,
+        };
+        let parent_entry = self
+            .entry(parent)?
+            .ok_or(ChainError::UnknownParent(*parent))?;
+        let height = parent_entry.height() + 1;
+        let first = d.period_start(height);
+        // 数え始める前の区切りは、すべて Defined である。
+        let never_moved = |period_start: u64| {
+            period_start == 0 || period_start < d.start_height.min(d.timeout_height)
+        };
+        if never_moved(first) {
+            return Ok(DeploymentState::Defined);
+        }
+
+        // 区切りの最後のブロックを、新しいほうから集める。
+        let mut boundary = self.boundary_before(parent, first)?;
+        let mut pending = Vec::new();
+        let mut state = loop {
+            if let Some(state) = self.deployment_states.borrow().get(&boundary) {
+                break *state;
+            }
+            let period_start = first - pending.len() as u64 * d.period;
+            pending.push(boundary);
+            let previous = period_start - d.period;
+            if never_moved(previous) {
+                break DeploymentState::Defined;
+            }
+            boundary = self.boundary_before(&boundary, previous)?;
+        };
+
+        // 古い順に決めて控える。
+        for (back, boundary) in pending.iter().enumerate().rev() {
+            let period_start = first - back as u64 * d.period;
+            let signals = if state == DeploymentState::Started {
+                self.count_signals(boundary, d.period, |version| d.signals(version))?
+            } else {
+                0
+            };
+            state = d.next_state(state, period_start, signals);
+            self.deployment_states.borrow_mut().insert(*boundary, state);
+        }
+        Ok(state)
+    }
+
+    /// `from` の枝で、高さ `period_start − 1` の祖先 (1 つ前の区切りの最後)。
+    fn boundary_before(&self, from: &Hash, period_start: u64) -> Result<Hash, ChainError> {
+        let height = period_start - 1;
+        self.ancestor_hash_at(from, height)?.ok_or_else(|| {
+            ChainError::Store(format!(
+                "no ancestor at height {height} on the branch of {from}"
+            ))
+        })
+    }
+
+    /// `last` で終わる `period` 個のブロックのうち、印の付いたものの数。
+    fn count_signals(
+        &self,
+        last: &Hash,
+        period: u64,
+        signals: impl Fn(u32) -> bool,
+    ) -> Result<u64, ChainError> {
+        let mut count = 0;
+        let mut cursor = *last;
+        for _ in 0..period {
+            let entry = self.entry(&cursor)?.ok_or_else(|| {
+                ChainError::Store(format!("block {cursor} is missing from the index"))
+            })?;
+            if signals(entry.header.version) {
+                count += 1;
+            }
+            if entry.height() == 0 {
+                break;
+            }
+            cursor = entry.prev_hash();
+        }
+        Ok(count)
+    }
+
+    /// `parent` を親とするブロックで効く規則 ([`Rules`])。
+    pub fn rules_for_child_of(&self, parent: &Hash) -> Result<Rules, ChainError> {
+        Ok(Rules::when(
+            self.deployment_state_for_child_of(parent)?.is_active(),
+        ))
+    }
+
+    /// `parent` を親とするブロックに付ける `version`。
+    ///
+    /// 数えている間と、閾値に届いた後の猶予の区切りでは印を付ける
+    /// ([`DeploymentState::should_signal`])。それ以外は今までと同じ値。
+    pub fn block_version_for_child_of(&self, parent: &Hash) -> Result<u32, ChainError> {
+        let Activation::Signalled(d) = self.commitment_activation else {
+            return Ok(CURRENT_BLOCK_VERSION);
+        };
+        Ok(
+            if self.deployment_state_for_child_of(parent)?.should_signal() {
+                d.version_bits()
+            } else {
+                CURRENT_BLOCK_VERSION
+            },
+        )
+    }
+
+    /// `tip` を含む区切りで、これまでに印の付いたブロックの数と、
+    /// その区切りで積まれたブロックの数。表示用。
+    ///
+    /// 印で有効にするのでなければ `None`。
+    pub fn signals_so_far(&self, tip: &Hash) -> Result<Option<(u64, u64)>, ChainError> {
+        let Activation::Signalled(d) = self.commitment_activation else {
+            return Ok(None);
+        };
+        let tip_entry = self.entry(tip)?.ok_or(ChainError::UnknownParent(*tip))?;
+        let elapsed = tip_entry.height() + 1 - d.period_start(tip_entry.height());
+        let count = self.count_signals(tip, elapsed, |version| d.signals(version))?;
+        Ok(Some((count, elapsed)))
     }
 
     /// `tip` の枝の上で、過去のブロックの Median Time Past を引く口。
@@ -721,7 +981,8 @@ impl<S: ChainStore> Chain<S> {
             });
         }
 
-        let entry = match self.entry(&hash)? {
+        // `admitted` は、ヘッダがすでに記憶域に書かれているか。
+        let (entry, admitted) = match self.entry(&hash)? {
             // 本体をすでに持っている。
             Some(known) if known.has_body() => return Ok(AcceptOutcome::Duplicate),
             Some(known) if known.status == BlockStatus::Invalid => {
@@ -731,12 +992,40 @@ impl<S: ChainStore> Chain<S> {
             //
             // ヘッダはハッシュが一致する以上まったく同じものであり、
             // 受け取った時点で検証済みである。やり直す必要はない。
-            Some(known) => BlockIndexEntry {
-                status: BlockStatus::HeaderValid,
-                ..known
-            },
-            None => self.validated_entry(&block.header, pow, now)?,
+            Some(known) => {
+                let admitted = !self.pending.borrow().contains_key(&hash);
+                (
+                    BlockIndexEntry {
+                        status: BlockStatus::HeaderValid,
+                        ..known
+                    },
+                    admitted,
+                )
+            }
+            None => (self.validated_entry(&block.header, pow, now)?, false),
         };
+
+        // 軽い枝の本体は書かない ([`ANTI_DOS_BLOCKS`])。本体はヘッダより
+        // ずっと大きいので、ここを塞がないと同じ手口でもっと早く埋められる。
+        //
+        // **ヘッダが既に書かれているものは対象にしない。** 初期同期では
+        // ヘッダが先に先端まで届き、本体は創世から順に届く。その本体は
+        // 最良のヘッダより遥かに軽いが、書かれたヘッダの枝のものである。
+        //
+        // ヘッダだけは手元に置く。続きのブロックが繋がれるようにするためで、
+        // 枝が重くなったら書かれ、捨てた本体は改めて取り寄せる
+        // ([`Chain::missing_bodies`])。
+        if !admitted && entry.cumulative_work < self.anti_dos_threshold()? {
+            if !self.pending.borrow().contains_key(&hash) {
+                self.hold_pending(BlockIndexEntry {
+                    status: BlockStatus::HeaderOnly,
+                    ..entry
+                });
+            }
+            return Ok(AcceptOutcome::SideChain);
+        }
+        self.flush_pending_ancestors(&entry.prev_hash())?;
+        self.pending.borrow_mut().remove(&hash);
 
         self.store
             .put_block(&block, &entry)
@@ -771,6 +1060,11 @@ impl<S: ChainStore> Chain<S> {
 
         let mut entry = self.validated_entry(header, pow, now)?;
         entry.status = BlockStatus::HeaderOnly;
+        if entry.cumulative_work < self.anti_dos_threshold()? {
+            self.hold_pending(entry);
+            return Ok(HeaderOutcome::Pending);
+        }
+        self.flush_pending_ancestors(&entry.prev_hash())?;
         self.put_entry(&entry)?;
         Ok(HeaderOutcome::New)
     }
@@ -982,8 +1276,13 @@ impl<S: ChainStore> Chain<S> {
                 .ok_or(ChainError::RollbackFailed(format!(
                     "the body of block {hash} is missing"
                 )))?;
+            // 前に繋いだときと同じ規則で繋ぎ直す。規則は祖先だけから
+            // 決まるので、同じ枝に戻す限り答えは変わらない。
+            let rules = self
+                .rules_for_child_of(&block.header.prev_hash)
+                .map_err(|e| ChainError::RollbackFailed(e.to_string()))?;
             self.store
-                .connect_block(&block)
+                .connect_block(&block, rules)
                 .map_err(|e| ChainError::RollbackFailed(e.to_string()))?;
         }
         Ok(())
@@ -1028,6 +1327,10 @@ impl<S: ChainStore> Chain<S> {
             now,
         };
 
+        // **検証と UTXO の適用には同じ規則を渡す。** 片方だけ違うと、検証で
+        // 見えた出力と UTXO に入る出力が食い違う。
+        let rules = self.rules_for_child_of(&parent_hash)?;
+
         {
             let view = self.store.utxo_view().map_err(Self::store_err)?;
             let times = self.times_on(parent_hash);
@@ -1037,11 +1340,14 @@ impl<S: ChainStore> Chain<S> {
                 signature_checks: self.signature_checks_for(&hash, height)?,
                 relative_locktime: (height >= self.relative_locktime_height)
                     .then_some(&times as &dyn ChainTimes),
+                rules,
             };
             validate_block(&block, &ctx, &AcceptAnyPow)?;
         }
 
-        self.store.connect_block(&block).map_err(Self::store_err)?;
+        self.store
+            .connect_block(&block, rules)
+            .map_err(Self::store_err)?;
 
         self.set_status(&hash, BlockStatus::FullyValid)?;
         Ok(())

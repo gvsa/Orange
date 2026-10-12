@@ -314,6 +314,15 @@ and this chain has no scripts. Therefore **a third party cannot alter a
 transaction ID.** This property lets pre-signed transactions (the refund path of
 an atomic swap, for instance) work safely without anything equivalent to SegWit.
 
+> **The exception up to 0.4 (closed in 0.5.0)**: the signature field is 64 bytes
+> (default form) or 65 bytes (the last byte is the sighash type, [§8.3](#83-sighash-flags)).
+> Up to 0.4, a 65-byte signature ending in `0x00` was also accepted as the
+> default form, so **anyone could append `0x00` to a 64-byte signature and change
+> the txid while the transaction stayed valid.** From 0.5.0 that form is not
+> relayed, and it becomes invalid in blocks where the soft fork of
+> [§10.9](#109-soft-fork-activation-miner-signalling) is active. The property
+> above holds at the consensus level only once that soft fork is active.
+
 ### 5.4 Merkle tree
 
 The **RFC 6962 (Certificate Transparency)** construction is used.
@@ -367,11 +376,23 @@ cross-network misdelivery structurally impossible.
 | ---: | :---: | --- | --- |
 | 0 | `q` | Schnorr x-only public key (32 bytes) | implemented in v1 |
 | 1 | `p` | reserved (script hash, etc.) | undefined |
-| 2–31 | | reserved | undefined |
+| 2 | | reserved | undefined |
+| 3 | | commitment output ([§7.7](#77-commitment-outputs)). **Not a payee** | 0.5.0 (soft fork) |
+| 4–31 | | reserved | undefined |
 
-**Forward compatibility**: a wallet SHOULD allow sending to an address with an
-unknown version after displaying a warning. That way, when a version is added
-later, older wallets can still pay the new addresses.
+**Do not pay unknown versions**: a wallet MUST NOT send to an address whose
+version it does not understand. Until a soft fork gives a version meaning, its
+outputs can be spent by anyone ([§10.4](#104-handling-unknown-versions)), so
+sending to it loses the funds.
+
+> Up to 0.4 this document said a wallet "SHOULD allow sending after displaying a
+> warning". Sending to a version before its activation lets anyone take the
+> funds, so it should never have been allowed. The implementation (`oag-wallet`)
+> refused from the start; this document now matches it.
+
+Version 3 is not a payee, so **nothing may be sent to an address of that
+version**. Commitment outputs are made with a dedicated wallet operation
+([§7.7](#77-commitment-outputs)).
 
 ### 6.4 Derivation
 
@@ -782,6 +803,51 @@ The `signature` field is not a signature; it is the miner's extra-nonce space.
 Beginning it with the block height prevents coinbases at different heights from
 sharing a txid (the same intent as Bitcoin's BIP34).
 
+### 7.7 Commitment outputs
+
+**An output that carries 0 OAG and 2 to 40 bytes, and that nobody can spend.**
+It records a hash (a timestamp, a release proof, a key-handover notice). It is
+not a place for scripts or data. It corresponds to Bitcoin's `OP_RETURN` output.
+
+```
+TxOutput {
+    amount:      0
+    version:     3
+    payload_len: 2..=40
+    payload:     the bytes to record
+}
+```
+
+From the block where the soft fork of [§10.9](#109-soft-fork-activation-miner-signalling)
+is active, the following MUST hold.
+
+1. A version-3 output is **invalid** unless its amount is 0. Coinbase outputs
+   included.
+2. A version-3 output **does not enter the UTXO set**, so nobody can spend it.
+   Later transactions in the same block do not see it either.
+3. It is not listed among the outputs created in the undo data. Undo never
+   touches it, so **the shape of the undo data does not change.**
+
+The payload length (2 to 40) is the existing output rule ([§7.1](#71-structure)).
+Consensus does not interpret the payload; namespaces and meaning belong to
+applications.
+
+**Version-3 outputs created before activation keep their old treatment.** They
+stay in the UTXO set and remain spendable by anyone as an unknown version
+([§10.4](#104-handling-unknown-versions)). The rules apply only to outputs created
+in blocks where they are in force.
+
+Relay ([§13.3.1](#1331-handling-unknown-versions-policy-layer)):
+
+| | before activation | after activation |
+| --- | --- | --- |
+| creating a version-3 output | not relayed (unknown version) | relayed; exempt from dust |
+| how many per transaction | — | **at most 1** (not a consensus rule) |
+| spending a version-3 output | not relayed | not relayed |
+
+They are not entered into the address index. The explorer and RPC show them as
+`commitment: <hex>` instead of an address.
+
 ---
 
 ## 8. Signature hash (sighash)
@@ -882,6 +948,13 @@ this specification.
 
 For anything other than `0x00`, the signature is 65 bytes and the last byte is
 the flag.
+
+**`0x00` must not be written as 65 bytes.** The default form is 64 bytes. A
+65-byte signature ending in `0x00` MUST NOT be relayed, and it MUST be
+**invalid** in blocks where the soft fork of
+[§10.9](#109-soft-fork-activation-miner-signalling) is active (as in Bitcoin's
+BIP341). Allowing it lets a third party change a txid by appending `0x00`
+([§5.3](#53-signatures-schnorr-bip340)).
 
 Any byte not in the table above (`0x04` and up, and `0x80`, which would be
 `ANYONECANPAY` alone) is **undefined and MUST be rejected**.
@@ -1093,6 +1166,45 @@ verification MUST come last.**
 ```
 
 In addition, a per-peer rate limit on header receipt MUST be applied.
+
+#### Guarding connections and headers (0.5.0)
+
+So that merely connecting cannot stop a node, the following apply. The values
+are the implementation's defaults.
+
+| Item | Value | Notes |
+| --- | --- | --- |
+| handshake timeout | 60 s | `ping` does not run until the handshake is done |
+| payload limit during the handshake | 1 KiB | only `version` / `verack` arrive, so 1 MiB is not buffered |
+| inbound connections | 117 | Bitcoin Core's 125 minus the 8 outbound |
+| inbound connections per IP | 4 | loopback is not counted |
+| header rate limit | bursts of 4,000, refilled at 1,000 per second | per peer; checked before any PoW |
+| ban | 24 hours | for invalid headers (PoW, difficulty, timestamps, invalid ancestor) or exceeding the rate limit; kept in memory |
+
+When `accept` fails (for example, out of file descriptors), the listener MUST
+keep going. Up to 0.4 it stopped and accepted nothing until restarted.
+
+A peer that relays an invalid block body is disconnected but not banned: around
+a soft fork, nodes that have not upgraded may carry blocks that break the new
+rules.
+
+#### Light branches are not written to storage
+
+The work in one header is set by the difficulty at its height. **Branching from
+an old height, when the difficulty was low, makes valid headers cheap to produce
+in bulk**, and writing everything that validates would let them fill the disk.
+
+So a header on a branch lighter than **the best header's cumulative work minus
+144 blocks' worth (the best header's difficulty × 144)** MUST be kept in memory
+(at most 50,000) instead of being written. When later headers push the branch
+past that threshold, it is written together with its ancestors. Bodies on such
+branches are not written either (only the header is kept). This is the same idea
+as Bitcoin Core's anti-DoS threshold.
+
+**This is not a limit on reorg depth** ([§10.6](#106-choosing-the-longest-chain)).
+However deep a branch forks, it is written and switched to once it carries
+enough work. The continuation of headers held in memory is requested with a
+`getheaders` that starts at the last header received.
 
 **PoW is checked once, when the header enters the index (since 0.1.2).** It is
 not checked again when the body is connected. The header is bound to the body
@@ -1406,6 +1518,64 @@ passed to make that claim.
 The mempool is **always checked in full**. This is a relaxation that is only
 defensible for the deeply buried past; it does not apply to unconfirmed
 transactions.
+
+### 10.9 Soft fork activation (miner signalling)
+
+From 0.5.0, soft forks are **activated once enough miners mark their blocks**.
+This follows Bitcoin's BIP9; the only difference is that periods are counted in
+heights rather than time (as in BIP8).
+
+#### The mark
+
+A block "signals" when the top three bits of its header `version` are `001`
+(`0x20000000`) and the assigned bit is set. Bit 0 is reserved for AUX_POW
+([§9.5](#95-reservation-for-aux_pow-merged-mining)) and is not used. Consensus looks at
+nothing but bit 0, so signalling blocks are valid to old nodes.
+
+#### States
+
+```
+  Defined ──(start height)──▶ Started ──(threshold)──▶ LockedIn ──▶ Active
+                                 │
+                                 └──(timeout height)──▶ Failed
+```
+
+- The state **changes only at the start of a period**. Period starts are
+  multiples of the period. The period starting at height 0 is `Defined`.
+- The state of period `P` follows from the state of period `P − period` and the
+  number of signalling blocks in it (heights `P − period` to `P − 1`).
+  - `Defined`: `Failed` if `P ≥ timeout`, `Started` if `P ≥ start`.
+  - `Started`: `LockedIn` if the count reaches the threshold; otherwise `Failed`
+    if `P ≥ timeout`. **The threshold is checked before the timeout** (as in
+    Bitcoin Core).
+  - `LockedIn` is always followed by `Active`. Fewer marks in the grace period do
+    not undo it.
+  - `Active` and `Failed` never change.
+- The state follows **only from the headers of ancestor blocks**; no bodies are
+  needed. A reorg changes the answer to follow the branch. An implementation may
+  remember it keyed by the hash of a period's last block.
+- Miners signal while `Started` and `LockedIn`.
+
+#### The 0.5.0 soft fork (commitments)
+
+One mark activates both commitment outputs ([§7.7](#77-commitment-outputs)) and
+the rule that makes 65-byte signatures ending in `0x00` invalid
+([§8.3](#83-sighash-flags)).
+
+| Network | Bit | Period | Threshold | Start | Timeout |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| mainnet | 1 | 1,440 (about a day) | 960 (2/3) | 40,320 | 565,920 (about a year later) |
+| testnet | — | — | — | active from the start | — |
+| regtest | — | — | — | active from the start | — |
+
+The start is the first period boundary after the relative-locktime fork (height
+40,000, [§7.5](#75-sequence-relative-locktime)). Soft forks are not stacked.
+
+The rules apply from the blocks that are active (those in an `Active` period).
+Blocks before that MUST be validated without them.
+
+The node's `getinfo` reports the state and the number of signalling blocks in
+the current period under `softfork`.
 
 ---
 ## 11. Proof of work
@@ -3354,9 +3524,11 @@ Items to be decided during implementation.
       **`satoshilabs/slips` pull request #2062 has been submitted for number
       1033 and is awaiting review.** The implementation carries 1033 and can
       derive mainnet keys. testnet uses reserved number 1 and does not depend on
-      this registration. Since neither acceptance nor timing is guaranteed, it is
-      built into the mainnet launch schedule. **Until registration is final, do
-      not put funds on a mainnet address**
+      this registration. Neither acceptance nor timing is guaranteed.
+      **mainnet started on 2026-09-17 without waiting for the registration, and
+      it holds funds.** It uses 1033 while the request is pending. If another
+      number is accepted, the constant changes and the wallet must keep reading
+      the 1033 path so that funds can be moved ([§6.6](#66-hd-wallets))
 
 ### Priority: low
 
@@ -3367,8 +3539,9 @@ Items to be decided during implementation.
       "no byte string causes a `panic`" and "anything that decodes re-encodes
       back to the same bytes". But it is guesswork: it neither measures path
       coverage nor digs into the branches it gets stuck on. Whether to add
-      `cargo-fuzz` (libFuzzer) as a separate crate will be decided before the
-      mainnet launch
+      `cargo-fuzz` (libFuzzer) as a separate crate was to be decided before the
+      mainnet launch; **it is still undecided after the launch**. Until then the
+      tests above stand in
 
 - [x] **An English specification** — this file. The Japanese
       [`SPEC.md`](SPEC.md) remains normative; this is a translation

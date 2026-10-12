@@ -213,7 +213,8 @@ impl Tally {
         for tx in &block.transactions {
             let coinbase = tx.is_coinbase();
             if coinbase {
-                for output in &tx.outputs {
+                // コミットメント出力は誰の報酬でもない (SPEC §7.7)。数えない。
+                for output in tx.outputs.iter().filter(|o| !o.lock.is_commitment()) {
                     miners.push(output.lock.clone());
                     if self.miners.insert(output.lock.clone()) {
                         first_time_miners += 1;
@@ -229,6 +230,10 @@ impl Tally {
             }
             let txid = tx.txid();
             for (index, output) in tx.outputs.iter().enumerate() {
+                // コミットメント出力は誰の持ち分でもなく、使われることもない。
+                if output.lock.is_commitment() {
+                    continue;
+                }
                 let amount = output.amount.to_atomic();
                 self.unspent.insert(
                     OutPoint::new(txid, index as u32),
@@ -238,7 +243,12 @@ impl Tally {
                     *self.balances.entry(output.lock.clone()).or_insert(0) += amount;
                 }
             }
-            receivers.extend(tx.outputs.iter().map(|o| o.lock.clone()));
+            receivers.extend(
+                tx.outputs
+                    .iter()
+                    .filter(|o| !o.lock.is_commitment())
+                    .map(|o| o.lock.clone()),
+            );
         }
         self.transactions += transactions;
 
@@ -578,6 +588,20 @@ mod tests {
         // 採掘者 2 人と、受け取った 2 人。
         assert_eq!(tally.recent_receivers(), 4);
         assert_eq!(tally.transactions(), 2);
+    }
+
+    #[test]
+    fn a_commitment_is_neither_a_miner_nor_a_holder() {
+        let mut tally = Tally::new();
+        tally.add(&block(0, 0, 1, 9, &[]), Hash::ZERO);
+        let mut b = block(1, 10_000, 100, 1, &[2]);
+        let note = TxOutput::new(Amount::ZERO, Lock::commitment(vec![7; 32]).unwrap());
+        b.transactions[0].outputs.push(note.clone());
+        b.transactions[1].outputs.push(note);
+        tally.add(&b, Hash::ZERO);
+        assert_eq!(tally.miners(), 1, "only the real payee mined");
+        assert_eq!(tally.recent_receivers(), 2);
+        assert_eq!(tally.unspent_outputs(), 2);
     }
 
     #[test]

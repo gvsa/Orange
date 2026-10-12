@@ -345,6 +345,19 @@ async fn stats_page(shared: &Shared) -> Response {
     stat(&mut body, "hashrate (1 h)", &rate(stats::SHORT_WINDOW));
     stat(&mut body, "hashrate (24 h)", &rate(stats::LONG_WINDOW));
     stat(&mut body, "next difficulty", &group(status.next_difficulty));
+    // コミットメント出力などのソフトフォーク (SPEC §10.9)。数えている間は、
+    // 今の区切りで印の付いたブロックの数も出す。
+    let softfork = &status.softfork;
+    let label = match (softfork.deployment, softfork.signals) {
+        (Some(d), Some((count, elapsed))) if softfork.state.should_signal() => format!(
+            "{} — {count} of {elapsed} signalled (needs {} of {})",
+            softfork.state.name(),
+            d.threshold,
+            d.period
+        ),
+        _ => softfork.state.name().to_string(),
+    };
+    stat(&mut body, "soft fork (commitments)", &esc(&label));
     body.push_str("</div>");
 
     body.push_str("<h2>people</h2><div class=\"grid\">");
@@ -1534,6 +1547,25 @@ fn tx_detail(
     out.push_str("<h2>outputs</h2><div class=\"wrap\"><table class=\"list\">");
     out.push_str("<tr class=\"head\"><th>#</th><th>address</th><th>amount</th></tr>");
     for (n, output) in tx.outputs.iter().enumerate() {
+        // コミットメント出力は誰の支払いでもない。アドレスにせず、刻まれた
+        // 中身をそのまま見せる (SPEC §7.7)。
+        if output.lock.is_commitment() {
+            let hex: String = output
+                .lock
+                .payload()
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect();
+            let _ = write!(
+                out,
+                "<tr><td data-label=\"#\">{n}</td>\
+                 <td data-label=\"address\" class=\"mono\">commitment: {hex}</td>\
+                 <td data-label=\"amount\" class=\"num\">{amount} OAG</td></tr>",
+                hex = esc(&hex),
+                amount = esc(&output.amount.to_string()),
+            );
+            continue;
+        }
         let addr = output
             .lock
             .to_address(network)

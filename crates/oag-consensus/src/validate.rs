@@ -87,6 +87,68 @@ pub enum SignatureChecks {
     Skip,
 }
 
+/// ソフトフォークで加わり、そのブロックで効いている規則 (SPEC §10.9)。
+///
+/// どれも**条件を厳しくするだけ**の規則である。有効化より前のブロックは
+/// これらを課さずに作られたので、`false` のまま検証しなければならない。
+/// 有効かどうかはチェーン (祖先のブロックの印) から決まる。決めるのは
+/// `oag-chain` の責務であり、ここはその結論を受け取るだけである。
+///
+/// 同じソフトフォークで入ったので、今は 2 つとも同時に `true` になる。
+/// それでも欄を分けてあるのは、検証のどこで何を課すかを読み違えないため
+/// である。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Rules {
+    /// コミットメント出力 (版数 3) の規則 (SPEC §7.7)。
+    ///
+    /// - 版数 3 の出力は金額 0 でなければ無効。
+    /// - 版数 3 の出力は UTXO に入らない。したがって誰にも使えない。
+    ///
+    /// **このブロックで作られる出力にだけ効く。** 有効化より前に作られた
+    /// 版数 3 の出力は UTXO に残っており、未知の版数として誰でも使える
+    /// まま (SPEC §10.4) である。さかのぼって扱いを変えない。
+    pub commitment_outputs: bool,
+    /// 65 バイトの署名で末尾の種別が `0x00` のものを無効にする (SPEC §8.3)。
+    ///
+    /// `0x00` は既定形式であり、本来は 64 バイトで書く。65 バイトの形も
+    /// 受け付けると、**第三者が署名の後ろに `0x00` を足すだけで txid を
+    /// 変えられる** (SPEC §5.3)。BIP341 と同じく、この形を無効にする。
+    pub strict_sighash_byte: bool,
+}
+
+impl Rules {
+    /// ソフトフォークの規則を何も課さない。有効化より前のブロック。
+    pub const NONE: Rules = Rules {
+        commitment_outputs: false,
+        strict_sighash_byte: false,
+    };
+
+    /// すべて課す。有効化の後のブロック。
+    pub const ALL: Rules = Rules {
+        commitment_outputs: true,
+        strict_sighash_byte: true,
+    };
+
+    /// 有効かどうかから作る。
+    pub const fn when(active: bool) -> Rules {
+        if active {
+            Rules::ALL
+        } else {
+            Rules::NONE
+        }
+    }
+
+    /// この出力を UTXO に入れるか。
+    ///
+    /// 規則が効いている間に作られたコミットメント出力だけが入らない。
+    /// 検証の `register_outputs` と [`apply_block_to`](crate::utxo::apply_block_to)
+    /// は**必ずこれで判断する**。片方だけ別の条件で決めると、検証で
+    /// 見えた出力と UTXO にある出力が食い違う。
+    pub fn enters_utxo(&self, output: &TxOutput) -> bool {
+        !(self.commitment_outputs && output.lock.is_commitment())
+    }
+}
+
 /// 過去のブロックの Median Time Past を引く口 (SPEC §7.5)。
 ///
 /// 時間で指定した相対 locktime は、参照先の出力が入ったブロックの時刻から
@@ -123,6 +185,8 @@ pub struct BlockContext<'a> {
     /// 強制が有効になる高さ以降のブロックでは `Some` を渡す。それより前の
     /// ブロックは強制なしで作られたので、`None` で検証しなければならない。
     pub relative_locktime: Option<&'a dyn ChainTimes>,
+    /// 採掘者の印で有効になった規則 ([`Rules`])。
+    pub rules: Rules,
 }
 
 /// 検証の失敗。
@@ -298,6 +362,20 @@ pub enum ValidationError {
         /// Median Time Past。
         time: i64,
     },
+    /// コミットメント出力に金額が付いている (SPEC §7.7)。
+    #[error("output {output} is a commitment but carries {amount}; it must be 0")]
+    CommitmentWithAmount {
+        /// 出力番号。
+        output: usize,
+        /// 付いていた金額。
+        amount: Amount,
+    },
+    /// 65 バイトの署名の末尾が `0x00` (既定形式) である (SPEC §8.3)。
+    #[error("the signature of input {index} spells the default hash type out as 0x00")]
+    ExplicitDefaultHashType {
+        /// 入力番号。
+        index: usize,
+    },
     /// 相対 locktime の条件を満たしていない (SPEC §7.5)。
     #[error("the relative locktime of input {index} ({locktime:?}) is not satisfied")]
     RelativeLocktimeNotSatisfied {
@@ -353,7 +431,9 @@ pub struct TransactionSummary {
 /// ならない。コインベースは本関数の対象外である。
 ///
 /// `relative_locktime` が `Some` なら相対 locktime を強制する
-/// ([`BlockContext::relative_locktime`])。
+/// ([`BlockContext::relative_locktime`])。`rules` は、このトランザクションが
+/// 入るブロックで効いている規則である ([`BlockContext::rules`])。
+#[allow(clippy::too_many_arguments)]
 pub fn validate_transaction(
     tx: &Transaction,
     utxo: &dyn UtxoView,
@@ -362,6 +442,7 @@ pub fn validate_transaction(
     index: usize,
     signature_checks: SignatureChecks,
     relative_locktime: Option<&dyn ChainTimes>,
+    rules: Rules,
 ) -> Result<TransactionSummary, ValidationError> {
     if tx.inputs.is_empty() {
         return Err(ValidationError::NoInputs { index });
@@ -369,6 +450,7 @@ pub fn validate_transaction(
     if tx.outputs.is_empty() {
         return Err(ValidationError::NoOutputs { index });
     }
+    check_commitment_amounts(tx, rules)?;
 
     let size = tx.size();
     if size > params::MAX_TX_SIZE {
@@ -438,10 +520,29 @@ pub fn validate_transaction(
     let spent_outputs: Vec<TxOutput> = spent_entries.iter().map(|e| e.output.clone()).collect();
     let cache = SighashCache::new(tx, &spent_outputs)?;
     for (input_index, spent) in spent_outputs.iter().enumerate() {
-        verify_input_signature(&cache, input_index, &spent.lock, signature_checks)?;
+        verify_input_signature(&cache, input_index, &spent.lock, signature_checks, rules)?;
     }
 
     Ok(TransactionSummary { fee })
+}
+
+/// コミットメント出力の金額が 0 か (SPEC §7.7)。
+///
+/// 規則が効いていなければ何も見ない。有効化より前は、版数 3 も他の未知の
+/// 版数と同じく、金額を付けて作れる。
+fn check_commitment_amounts(tx: &Transaction, rules: Rules) -> Result<(), ValidationError> {
+    if !rules.commitment_outputs {
+        return Ok(());
+    }
+    for (output, out) in tx.outputs.iter().enumerate() {
+        if out.lock.is_commitment() && out.amount != Amount::ZERO {
+            return Err(ValidationError::CommitmentWithAmount {
+                output,
+                amount: out.amount,
+            });
+        }
+    }
+    Ok(())
 }
 
 /// locktime の条件を満たしているか (SPEC §7.4)。
@@ -512,11 +613,19 @@ fn check_relative_locktimes(
 /// **この性質のため、未知の版数のアドレスへ送金してはならない。**
 /// ウォレットは警告を出し、ノードポリシーは未知の版数を含む
 /// トランザクションを中継しない。
+///
+/// # 末尾が `0x00` の 65 バイトの署名
+///
+/// `0x00` は既定形式で、本来は 64 バイトで書く。0.4 までは 65 バイトの
+/// 形も既定形式として通していたため、**誰でも署名の後ろに `0x00` を足して
+/// txid を変えられた** (SPEC §5.3)。`rules.strict_sighash_byte` が効く
+/// ブロックでは無効にする。効く前のブロックは、通した形のまま検証する。
 fn verify_input_signature(
     cache: &SighashCache<'_>,
     index: usize,
     lock: &Lock,
     signature_checks: SignatureChecks,
+    rules: Rules,
 ) -> Result<(), ValidationError> {
     if lock.version() != VERSION_PUBKEY {
         return Ok(());
@@ -525,6 +634,9 @@ fn verify_input_signature(
     let signature_field = &cache.transaction().inputs[index].signature;
     let (sig_bytes, hash_type) = match signature_field.len() {
         64 => (&signature_field[..], SighashType::DEFAULT),
+        65 if rules.strict_sighash_byte && signature_field[64] == 0x00 => {
+            return Err(ValidationError::ExplicitDefaultHashType { index });
+        }
         65 => (
             &signature_field[..64],
             SighashType::from_byte(signature_field[64])?,
@@ -673,7 +785,7 @@ pub fn validate_block(
 
     // コインベースの出力を登録する。成熟期間があるため同一ブロック内では
     // 使用できないが、状態としては存在させる。
-    register_outputs(&mut overlay, coinbase, header.height, true);
+    register_outputs(&mut overlay, coinbase, header.height, true, ctx.rules);
 
     let mut block_spent: HashSet<crate::tx::OutPoint> = HashSet::new();
     let mut total_fees = Amount::ZERO;
@@ -695,13 +807,14 @@ pub fn validate_block(
             index,
             ctx.signature_checks,
             ctx.relative_locktime,
+            ctx.rules,
         )?;
 
         // (c) ビューへ反映する。
         for input in &tx.inputs {
             overlay.mark_spent(input.prev_out);
         }
-        register_outputs(&mut overlay, tx, header.height, false);
+        register_outputs(&mut overlay, tx, header.height, false, ctx.rules);
 
         total_fees = total_fees
             .checked_add(summary.fee)
@@ -712,6 +825,9 @@ pub fn validate_block(
     if coinbase.outputs.is_empty() {
         return Err(ValidationError::NoOutputs { index: 0 });
     }
+    // コインベースにもコミットメント出力を置ける (SPEC §7.7)。金額 0 の
+    // 規則はここでも課す。トランザクションの検証を通らないので、別に見る。
+    check_commitment_amounts(coinbase, ctx.rules)?;
     let coinbase_size = coinbase.size();
     if coinbase_size > params::MAX_TX_SIZE {
         return Err(ValidationError::TransactionTooLarge {
@@ -742,7 +858,19 @@ pub fn validate_block(
     })
 }
 
-fn register_outputs(overlay: &mut OverlayView<'_>, tx: &Transaction, height: u64, coinbase: bool) {
+/// このブロックで作られた出力を、後のトランザクションから見えるようにする。
+///
+/// **UTXO に入らない出力は見せない** ([`Rules::enters_utxo`])。見せると、
+/// 同じブロックの後のトランザクションが、UTXO に存在しない出力を使えて
+/// しまう。判断は [`apply_block_to`](crate::utxo::apply_block_to) と同じ
+/// 関数で行う。
+fn register_outputs(
+    overlay: &mut OverlayView<'_>,
+    tx: &Transaction,
+    height: u64,
+    coinbase: bool,
+    rules: Rules,
+) {
     let txid = tx.txid();
     for (index, output) in tx.outputs.iter().enumerate() {
         // 出力番号は u32 である。1 出力は 3 バイト以上を要し、
@@ -750,6 +878,9 @@ fn register_outputs(overlay: &mut OverlayView<'_>, tx: &Transaction, height: u64
         // 番号は必ず収まる。**収まらなければ切り詰めてはならない。**
         // 切り詰めると別の出力が同じ OutPoint を持ち、UTXO セットが壊れる。
         let index = u32::try_from(index).expect("MAX_TX_SIZE bounds the output count");
+        if !rules.enters_utxo(output) {
+            continue;
+        }
         overlay.add_created(
             crate::tx::OutPoint::new(txid, index),
             UtxoEntry {
@@ -860,7 +991,8 @@ mod tests {
         let output = TxOutput::new(params::BLOCK_REWARD, Lock::pay_to_pubkey(&key.public_key()));
         let cb = coinbase(1, vec![output.clone()]);
         let mut utxo = UtxoSet::new();
-        utxo.apply_block(std::slice::from_ref(&cb), 1).unwrap();
+        utxo.apply_block(std::slice::from_ref(&cb), 1, Rules::NONE)
+            .unwrap();
         Fixture {
             utxo,
             key,
@@ -883,6 +1015,7 @@ mod tests {
                 },
                 utxo: &self.utxo,
                 relative_locktime: None,
+                rules: Rules::NONE,
             }
         }
 
@@ -1178,7 +1311,8 @@ mod tests {
                 MTP,
                 1,
                 SignatureChecks::Verify,
-                None
+                None,
+                Rules::NONE
             ),
             Err(ValidationError::ImmatureCoinbase { .. })
         ));
@@ -1191,7 +1325,8 @@ mod tests {
             MTP,
             1,
             SignatureChecks::Verify,
-            None
+            None,
+            Rules::NONE
         )
         .is_ok());
     }
@@ -1209,7 +1344,8 @@ mod tests {
                 MTP,
                 1,
                 SignatureChecks::Verify,
-                None
+                None,
+                Rules::NONE
             ),
             Err(ValidationError::MissingUtxo)
         );
@@ -1229,7 +1365,8 @@ mod tests {
                 MTP,
                 1,
                 SignatureChecks::Verify,
-                None
+                None,
+                Rules::NONE
             ),
             Err(ValidationError::DuplicateInput)
         );
@@ -1249,7 +1386,8 @@ mod tests {
                 MTP,
                 1,
                 SignatureChecks::Verify,
-                None
+                None,
+                Rules::NONE
             ),
             Err(ValidationError::OutputsExceedInputs { .. })
         ));
@@ -1268,7 +1406,8 @@ mod tests {
                 MTP,
                 3,
                 SignatureChecks::Verify,
-                None
+                None,
+                Rules::NONE
             ),
             Err(ValidationError::NoOutputs { index: 3 })
         );
@@ -1289,7 +1428,8 @@ mod tests {
                 MTP,
                 1,
                 SignatureChecks::Verify,
-                None
+                None,
+                Rules::NONE
             ),
             Err(ValidationError::BadSignature { index: 0 })
         );
@@ -1309,7 +1449,8 @@ mod tests {
                 MTP,
                 1,
                 SignatureChecks::Verify,
-                None
+                None,
+                Rules::NONE
             ),
             Err(ValidationError::BadSignature { index: 0 })
         );
@@ -1329,7 +1470,8 @@ mod tests {
                     MTP,
                     1,
                     SignatureChecks::Verify,
-                    None
+                    None,
+                    Rules::NONE
                 ),
                 Err(ValidationError::BadSignatureLength(len))
             );
@@ -1353,7 +1495,8 @@ mod tests {
             MTP,
             1,
             SignatureChecks::Verify,
-            None
+            None,
+            Rules::NONE
         )
         .is_ok());
     }
@@ -1373,7 +1516,8 @@ mod tests {
                 MTP,
                 1,
                 SignatureChecks::Verify,
-                None
+                None,
+                Rules::NONE
             ),
             Err(ValidationError::Sighash(SighashError::UnknownType(0x7f)))
         ));
@@ -1404,7 +1548,8 @@ mod tests {
         let mut utxo = UtxoSet::new();
         let future_lock = Lock::new(5, vec![0xab; 32]).unwrap();
         let cb = coinbase(1, vec![TxOutput::new(params::BLOCK_REWARD, future_lock)]);
-        utxo.apply_block(std::slice::from_ref(&cb), 1).unwrap();
+        utxo.apply_block(std::slice::from_ref(&cb), 1, Rules::NONE)
+            .unwrap();
 
         // 署名を一切付けずに使用できる。
         let tx = Transaction {
@@ -1424,7 +1569,8 @@ mod tests {
                 MTP,
                 1,
                 SignatureChecks::Verify,
-                None
+                None,
+                Rules::NONE
             )
             .is_ok(),
             "an unknown version must be spendable by anyone"
@@ -1442,7 +1588,8 @@ mod tests {
             1,
             vec![TxOutput::new(params::BLOCK_REWARD, Lock::unspendable())],
         );
-        utxo.apply_block(std::slice::from_ref(&cb), 1).unwrap();
+        utxo.apply_block(std::slice::from_ref(&cb), 1, Rules::NONE)
+            .unwrap();
 
         let spend_to = Lock::pay_to_pubkey(&SecretKey::generate().public_key());
         let base = Transaction {
@@ -1463,7 +1610,8 @@ mod tests {
                 MTP,
                 1,
                 SignatureChecks::Verify,
-                None
+                None,
+                Rules::NONE
             ),
             Err(ValidationError::BadSignatureLength(0)),
             "it was spendable without a signature"
@@ -1480,7 +1628,8 @@ mod tests {
                 MTP,
                 1,
                 SignatureChecks::Verify,
-                None
+                None,
+                Rules::NONE
             ),
             Err(ValidationError::BadLockPubkey { index: 0 }),
             "verification proceeded to the signature for the zero key"
@@ -1499,7 +1648,8 @@ mod tests {
                 MTP,
                 1,
                 SignatureChecks::Verify,
-                None
+                None,
+                Rules::NONE
             ),
             Err(ValidationError::BadLockPubkey { index: 0 }),
             "it could be spent by signing with our own key"
@@ -1533,7 +1683,8 @@ mod tests {
                 MTP,
                 1,
                 SignatureChecks::Verify,
-                None
+                None,
+                Rules::NONE
             ),
             Err(ValidationError::LocktimeNotSatisfied { .. })
         ));
@@ -1545,7 +1696,8 @@ mod tests {
             MTP,
             1,
             SignatureChecks::Verify,
-            None
+            None,
+            Rules::NONE
         )
         .is_ok());
     }
@@ -1566,7 +1718,8 @@ mod tests {
                 MTP,
                 1,
                 SignatureChecks::Verify,
-                None
+                None,
+                Rules::NONE
             ),
             Err(ValidationError::LocktimeNotSatisfied { .. })
         ));
@@ -1577,7 +1730,8 @@ mod tests {
             MTP + 100,
             1,
             SignatureChecks::Verify,
-            None
+            None,
+            Rules::NONE
         )
         .is_ok());
     }
@@ -1629,7 +1783,16 @@ mod tests {
         mtp: i64,
         times: Option<&dyn ChainTimes>,
     ) -> Result<TransactionSummary, ValidationError> {
-        validate_transaction(tx, &f.utxo, height, mtp, 1, SignatureChecks::Verify, times)
+        validate_transaction(
+            tx,
+            &f.utxo,
+            height,
+            mtp,
+            1,
+            SignatureChecks::Verify,
+            times,
+            Rules::NONE,
+        )
     }
 
     #[test]
@@ -1739,7 +1902,8 @@ mod tests {
         );
         let cb2 = coinbase(2, vec![output2.clone()]);
         let mut utxo = f.utxo.clone();
-        utxo.apply_block(std::slice::from_ref(&cb2), 2).unwrap();
+        utxo.apply_block(std::slice::from_ref(&cb2), 2, Rules::NONE)
+            .unwrap();
 
         let mut tx = Transaction {
             version: 2,
@@ -1772,6 +1936,7 @@ mod tests {
                 1,
                 SignatureChecks::Verify,
                 Some(&t),
+                Rules::NONE,
             )
         };
         assert_eq!(
@@ -1994,5 +2159,231 @@ mod tests {
         // タイムスタンプの逆転は許容される (LWMA が負の solvetime を扱う)。
         let timestamps = [100, 90, 110, 95, 105];
         assert_eq!(median_time_past(&timestamps), Some(100));
+    }
+
+    // ━━━━━━━━ ソフトフォーク: コミットメント出力 (SPEC §7.7) ━━━━━━━━
+
+    fn with_rules(ctx: BlockContext<'_>, rules: Rules) -> BlockContext<'_> {
+        BlockContext { rules, ..ctx }
+    }
+
+    fn commitment(amount: Amount) -> TxOutput {
+        TxOutput::new(amount, Lock::commitment(b"orange".to_vec()).unwrap())
+    }
+
+    impl Fixture {
+        /// 資金を使い、指定した出力を並べた署名済みトランザクション。
+        fn spend_to(&self, outputs: Vec<TxOutput>) -> Transaction {
+            let mut tx = Transaction {
+                version: CURRENT_TX_VERSION,
+                inputs: vec![TxInput::new(self.funded)],
+                outputs,
+                locktime: 0,
+            };
+            sign(
+                &mut tx,
+                std::slice::from_ref(&self.funded_output),
+                &[&self.key],
+            );
+            tx
+        }
+
+        fn validate_with(
+            &self,
+            tx: &Transaction,
+            rules: Rules,
+        ) -> Result<TransactionSummary, ValidationError> {
+            validate_transaction(
+                tx,
+                &self.utxo,
+                SPEND_HEIGHT,
+                MTP,
+                1,
+                SignatureChecks::Verify,
+                None,
+                rules,
+            )
+        }
+    }
+
+    fn payee() -> TxOutput {
+        TxOutput::new(
+            Amount::from_oag(9).unwrap(),
+            Lock::pay_to_pubkey(&SecretKey::generate().public_key()),
+        )
+    }
+
+    #[test]
+    fn a_commitment_must_carry_nothing_once_active() {
+        let f = fixture();
+        let one = Amount::from_atomic(1).unwrap();
+        let tx = f.spend_to(vec![payee(), commitment(one)]);
+
+        // 有効化の前は、他の未知の版数と同じく金額を付けて作れる。
+        assert!(f.validate_with(&tx, Rules::NONE).is_ok());
+        // 有効化の後は無効。
+        assert_eq!(
+            f.validate_with(&tx, Rules::ALL),
+            Err(ValidationError::CommitmentWithAmount {
+                output: 1,
+                amount: one
+            })
+        );
+        // 金額 0 なら通る。
+        let tx = f.spend_to(vec![payee(), commitment(Amount::ZERO)]);
+        assert!(f.validate_with(&tx, Rules::ALL).is_ok());
+    }
+
+    #[test]
+    fn a_coinbase_commitment_must_carry_nothing_once_active() {
+        let f = fixture();
+        let mut block = f.block("0.001");
+        // 受け取れる額の内側で、1 単位だけコミットメントへ回す。
+        let one = Amount::from_atomic(1).unwrap();
+        let cb = &mut block.transactions[0];
+        cb.outputs[0].amount = cb.outputs[0].amount.checked_sub(one).unwrap();
+        cb.outputs.push(commitment(one));
+        refresh_merkle(&mut block);
+
+        assert!(validate_block(&block, &f.context(), &AcceptAnyPow).is_ok());
+        assert_eq!(
+            validate_block(&block, &with_rules(f.context(), Rules::ALL), &AcceptAnyPow),
+            Err(ValidationError::CommitmentWithAmount {
+                output: 1,
+                amount: one
+            })
+        );
+
+        // 金額 0 のコミットメントなら、コインベースに置いてよい。
+        let mut block = f.block("0.001");
+        block.transactions[0].outputs.push(commitment(Amount::ZERO));
+        refresh_merkle(&mut block);
+        assert!(
+            validate_block(&block, &with_rules(f.context(), Rules::ALL), &AcceptAnyPow).is_ok()
+        );
+    }
+
+    /// 同じブロックの後のトランザクションから、作ったばかりのコミットメント
+    /// 出力が見えないこと。見えると、UTXO に入らない出力を使えてしまう。
+    #[test]
+    fn a_commitment_cannot_be_spent_in_its_own_block_once_active() {
+        let f = fixture();
+        let maker = f.spend_to(vec![payee(), commitment(Amount::ZERO)]);
+        // 版数 3 は署名を見ない (未知の版数と同じ扱い)。使うだけなら誰でも書ける。
+        let taker = Transaction {
+            version: CURRENT_TX_VERSION,
+            inputs: vec![TxInput::new(OutPoint::new(maker.txid(), 1))],
+            outputs: vec![TxOutput::new(
+                Amount::ZERO,
+                Lock::pay_to_pubkey(&SecretKey::generate().public_key()),
+            )],
+            locktime: 0,
+        };
+        let fee = params::BLOCK_REWARD
+            .checked_sub(Amount::from_oag(9).unwrap())
+            .unwrap();
+        let cb = coinbase(
+            SPEND_HEIGHT,
+            vec![TxOutput::new(
+                params::block_subsidy(SPEND_HEIGHT)
+                    .checked_add(fee)
+                    .unwrap(),
+                Lock::pay_to_pubkey(&SecretKey::generate().public_key()),
+            )],
+        );
+        let block = make_block(SPEND_HEIGHT, f.tip, vec![cb, maker, taker]);
+
+        // 有効化の前は、未知の版数として同じブロックの中でも使える。
+        assert!(validate_block(&block, &f.context(), &AcceptAnyPow).is_ok());
+        // 有効化の後は、そもそも存在しない。
+        assert_eq!(
+            validate_block(&block, &with_rules(f.context(), Rules::ALL), &AcceptAnyPow),
+            Err(ValidationError::MissingUtxo)
+        );
+    }
+
+    /// 有効化より前に作られたコミットメント出力は、さかのぼって扱いを
+    /// 変えない。未知の版数として誰でも使えるまま残る。
+    #[test]
+    fn a_commitment_made_before_activation_stays_spendable() {
+        let mut f = fixture();
+        let old = TxOutput::new(Amount::ONE_OAG, Lock::commitment(vec![7; 20]).unwrap());
+        let cb = coinbase(2, vec![old.clone()]);
+        f.utxo
+            .apply_block(std::slice::from_ref(&cb), 2, Rules::NONE)
+            .unwrap();
+        let outpoint = OutPoint::new(cb.txid(), 0);
+        assert!(f.utxo.contains(&outpoint).unwrap());
+
+        let taker = Transaction {
+            version: CURRENT_TX_VERSION,
+            inputs: vec![TxInput::new(outpoint)],
+            outputs: vec![TxOutput::new(
+                Amount::from_oag(1).unwrap(),
+                Lock::pay_to_pubkey(&SecretKey::generate().public_key()),
+            )],
+            locktime: 0,
+        };
+        let height = 2 + params::COINBASE_MATURITY;
+        for rules in [Rules::NONE, Rules::ALL] {
+            assert!(validate_transaction(
+                &taker,
+                &f.utxo,
+                height,
+                MTP,
+                1,
+                SignatureChecks::Verify,
+                None,
+                rules,
+            )
+            .is_ok());
+        }
+    }
+
+    // ━━━━━━━━ ソフトフォーク: 署名の末尾の 0x00 (SPEC §8.3) ━━━━━━━━
+
+    #[test]
+    fn a_trailing_zero_hash_type_changes_the_txid_but_is_refused_once_active() {
+        let f = fixture();
+        let tx = f.spend("0.001");
+        let mut padded = tx.clone();
+        padded.inputs[0].signature.push(0x00);
+        assert_eq!(padded.inputs[0].signature.len(), 65);
+        // これが穴の正体である。中身は同じで txid だけが違う。
+        assert_ne!(padded.txid(), tx.txid());
+
+        // 有効化の前は通っていた形のまま通す。
+        assert!(f.validate_with(&padded, Rules::NONE).is_ok());
+        // 有効化の後は無効。64 バイトの元の形は通る。
+        assert_eq!(
+            f.validate_with(&padded, Rules::ALL),
+            Err(ValidationError::ExplicitDefaultHashType { index: 0 })
+        );
+        assert!(f.validate_with(&tx, Rules::ALL).is_ok());
+    }
+
+    #[test]
+    fn explicit_hash_types_other_than_zero_are_still_accepted_once_active() {
+        let f = fixture();
+        let mut tx = f.spend("0.001");
+        let spent = [f.funded_output.clone()];
+        let t = SighashType::new(crate::sighash::SighashBase::All, false);
+        let msg = sighash(&tx, &spent, 0, t).unwrap();
+        let mut sig = f.key.sign(&msg).to_bytes().to_vec();
+        sig.push(t.to_byte());
+        assert_ne!(t.to_byte(), 0x00);
+        tx.inputs[0].signature = sig;
+        assert!(f.validate_with(&tx, Rules::ALL).is_ok());
+    }
+
+    #[test]
+    fn rules_when_follows_the_activation() {
+        assert_eq!(Rules::when(false), Rules::NONE);
+        assert_eq!(Rules::when(true), Rules::ALL);
+        assert_eq!(Rules::default(), Rules::NONE);
+        let c = commitment(Amount::ZERO);
+        assert!(Rules::NONE.enters_utxo(&c));
+        assert!(!Rules::ALL.enters_utxo(&c));
+        assert!(Rules::ALL.enters_utxo(&payee()));
     }
 }

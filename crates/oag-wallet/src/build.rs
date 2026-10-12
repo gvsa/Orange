@@ -120,6 +120,12 @@ pub enum BuildError {
         /// 上限。
         max: usize,
     },
+    /// コミットメント出力の中身が刻めない形 (2〜40 バイトの外)。
+    #[error("the commitment cannot be made: {reason}")]
+    BadCommitment {
+        /// 理由。
+        reason: String,
+    },
 }
 
 /// 支払いの注文。
@@ -156,6 +162,22 @@ pub struct Consolidate {
     pub fee_rate: Amount,
     /// 1 本に入れる入力の上限。`None` なら大きさが許す限り詰める。
     pub max_inputs: Option<usize>,
+}
+
+/// コミットメント出力を刻む注文 (SPEC §7.7)。
+///
+/// 金額 0 で中身 (2〜40 バイト) を刻むだけの出力を 1 つ作る。払うのは
+/// 手数料だけで、残りはおつりとして戻る。
+#[derive(Debug, Clone)]
+pub struct Commit {
+    /// 刻む中身。2〜40 バイト。ふつうはハッシュ (32 バイト) を入れる。
+    pub payload: Vec<u8>,
+    /// おつりの受取先。
+    pub change_to: Lock,
+    /// このトランザクションが入りうる最初のブロックの高さ。
+    pub next_height: u64,
+    /// 料率 (atomic / バイト)。
+    pub fee_rate: Amount,
 }
 
 /// 組み上がった支払い。
@@ -287,6 +309,91 @@ pub fn build(coins: &[Coin], spend: &Spend) -> Result<Draft, BuildError> {
         available,
         needed: spend.amount,
     })
+}
+
+/// コミットメント出力を 1 つ持つ取引を組み立てる。署名はまだ入らない。
+///
+/// 出力は `[コミットメント (金額 0), おつり]` の順に並べる。おつりが
+/// ほこり未満になるなら作らず、余りは手数料になる ([`build`] と同じ)。
+///
+/// **有効化の前に送ってはならない** (SPEC §10.9)。ノードは中継しないし、
+/// 有効化の前に作られた版数 3 の出力は誰でも使える。金額 0 なので失う物は
+/// 無いが、刻んだことにもならない。確かめるのは呼び出し側である。
+pub fn commit(coins: &[Coin], order: &Commit) -> Result<Draft, BuildError> {
+    let note = Lock::commitment(order.payload.clone()).map_err(|e| BuildError::BadCommitment {
+        reason: e.to_string(),
+    })?;
+    if !order.change_to.is_known_version() {
+        return Err(BuildError::UnknownLockVersion {
+            version: order.change_to.version(),
+        });
+    }
+
+    let mut usable: Vec<&Coin> = coins
+        .iter()
+        .filter(|c| c.is_spendable_at(order.next_height))
+        .collect();
+    usable.sort_by_key(|c| std::cmp::Reverse(c.output.amount));
+    let available =
+        Amount::sum(usable.iter().map(|c| c.output.amount)).ok_or(BuildError::Overflow)?;
+
+    let shape = |selected: &[&Coin], with_change: bool| -> (Transaction, usize) {
+        let inputs: Vec<TxInput> = selected
+            .iter()
+            .map(|coin| {
+                let mut input = TxInput::new(coin.outpoint);
+                input.signature = SIGNATURE_PLACEHOLDER.to_vec();
+                input
+            })
+            .collect();
+        let mut outputs = vec![TxOutput::new(Amount::ZERO, note.clone())];
+        if with_change {
+            // 大きさを測るため、符号化が最も長くなる額を仮に置く ([`build_with`])。
+            outputs.push(TxOutput::new(MAX_ENCODED_AMOUNT, order.change_to.clone()));
+        }
+        let tx = Transaction {
+            version: CURRENT_TX_VERSION,
+            inputs,
+            outputs,
+            locktime: 0,
+        };
+        let size = tx.encode().len();
+        (tx, size)
+    };
+    let fee_for = |size: usize| -> Result<Amount, BuildError> {
+        order
+            .fee_rate
+            .checked_mul(u64::try_from(size).map_err(|_| BuildError::Overflow)?)
+            .ok_or(BuildError::Overflow)
+    };
+
+    let mut total = Amount::ZERO;
+    let mut needed = Amount::ZERO;
+    for take in 1..=usable.len() {
+        let selected = &usable[..take];
+        total = total
+            .checked_add(selected[take - 1].output.amount)
+            .ok_or(BuildError::Overflow)?;
+
+        let (with_change, size_with) = shape(selected, true);
+        let fee_with = fee_for(size_with)?;
+        if let Some(change) = total.checked_sub(fee_with) {
+            if change >= params::DUST_THRESHOLD {
+                let mut tx = with_change;
+                tx.outputs[1].amount = change;
+                return finish(tx, selected, fee_with, change);
+            }
+        }
+
+        let (without_change, size_without) = shape(selected, false);
+        let fee_without = fee_for(size_without)?;
+        needed = fee_without;
+        if total >= fee_without {
+            return finish(without_change, selected, total, Amount::ZERO);
+        }
+    }
+
+    Err(BuildError::Insufficient { available, needed })
 }
 
 /// 手持ちを 1 つの出力にまとめる。まとめ切れなければ、入る分だけ。
@@ -520,6 +627,96 @@ mod tests {
             fee_rate: params::MIN_RELAY_FEE_RATE_PER_BYTE,
             max_inputs,
         }
+    }
+
+    // ━━━━━━━━ コミットメント出力 (SPEC §7.7) ━━━━━━━━
+
+    fn commit_of(payload: Vec<u8>, change_to: Lock) -> Commit {
+        Commit {
+            payload,
+            change_to,
+            next_height: 1_000,
+            fee_rate: params::MIN_RELAY_FEE_RATE_PER_BYTE,
+        }
+    }
+
+    #[test]
+    fn a_commitment_carries_nothing_and_the_rest_comes_back() {
+        let key = SecretKey::generate();
+        let coins = [coin("1", &key, 0), coin("5", &key, 1)];
+        let order = commit_of(vec![0xab; 32], lock_of(&key));
+        let draft = commit(&coins, &order).unwrap();
+
+        // 大きいほうから 1 つで足りる。
+        assert_eq!(draft.spent.len(), 1);
+        assert_eq!(draft.tx.outputs.len(), 2);
+        assert!(draft.tx.outputs[0].lock.is_commitment());
+        assert_eq!(draft.tx.outputs[0].amount, Amount::ZERO);
+        assert_eq!(draft.tx.outputs[0].lock.payload(), &[0xab; 32]);
+        assert_eq!(draft.tx.outputs[1].lock, lock_of(&key));
+        assert_eq!(
+            draft.change.checked_add(draft.fee).unwrap(),
+            "5".parse::<Amount>().unwrap()
+        );
+        // 手数料は、おつりを最も長い符号化で測った大きさで払う ([`build`] と
+        // 同じ)。実際の大きさの分より少しだけ多く、足りないことは無い。
+        let at_least = params::MIN_RELAY_FEE_RATE_PER_BYTE
+            .checked_mul(draft.tx.encode().len() as u64)
+            .unwrap();
+        let slack = params::MIN_RELAY_FEE_RATE_PER_BYTE.checked_mul(20).unwrap();
+        assert!(draft.fee >= at_least);
+        assert!(draft.fee <= at_least.checked_add(slack).unwrap());
+
+        // 署名したものが、有効化の後の規則で通ること。
+        let signed = sign(&draft, |_| Some(key.clone())).unwrap();
+        let mut utxo = oag_consensus::utxo::UtxoSet::new();
+        for c in &coins {
+            utxo.insert(
+                c.outpoint,
+                oag_consensus::UtxoEntry {
+                    output: c.output.clone(),
+                    height: c.height,
+                    is_coinbase: c.is_coinbase,
+                },
+            )
+            .unwrap();
+        }
+        let summary = oag_consensus::validate::validate_transaction(
+            &signed,
+            &utxo,
+            1_000,
+            0,
+            1,
+            oag_consensus::SignatureChecks::Verify,
+            None,
+            oag_consensus::Rules::ALL,
+        )
+        .unwrap();
+        assert_eq!(summary.fee, draft.fee);
+    }
+
+    #[test]
+    fn a_commitment_must_be_two_to_forty_bytes() {
+        let key = SecretKey::generate();
+        let coins = [coin("5", &key, 0)];
+        for len in [0usize, 1, 41] {
+            assert!(matches!(
+                commit(&coins, &commit_of(vec![1; len], lock_of(&key))),
+                Err(BuildError::BadCommitment { .. })
+            ));
+        }
+        for len in [2usize, 40] {
+            assert!(commit(&coins, &commit_of(vec![1; len], lock_of(&key))).is_ok());
+        }
+    }
+
+    #[test]
+    fn a_commitment_needs_something_to_pay_the_fee() {
+        let key = SecretKey::generate();
+        assert!(matches!(
+            commit(&[], &commit_of(vec![1; 32], lock_of(&key))),
+            Err(BuildError::Insufficient { .. })
+        ));
     }
 
     // ━━━━━━━━ まとめ ━━━━━━━━

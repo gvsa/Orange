@@ -39,6 +39,12 @@ pub struct Policy {
     /// として扱われる (SPEC §10.4)。有効化前にそのようなアドレスへ送金すると
     /// 資金を失うため、ポリシー層で作成も使用も中継しない。
     pub allow_unknown_lock_versions: bool,
+    /// 1 つのトランザクションに入れられるコミットメント出力の数
+    /// (SPEC §7.7)。
+    ///
+    /// **合意の規則ではない。** 1 つの取引で刻みたいものは、ハッシュを
+    /// 1 つにまとめれば足りる。何個も並べて場所を取る理由が無い。
+    pub max_commitments_per_tx: usize,
 }
 
 impl Default for Policy {
@@ -53,6 +59,7 @@ impl Default for Policy {
             incremental_relay_fee_rate: params::MIN_RELAY_FEE_RATE_PER_BYTE,
             max_replacement_count: 100,
             allow_unknown_lock_versions: false,
+            max_commitments_per_tx: 1,
         }
     }
 }

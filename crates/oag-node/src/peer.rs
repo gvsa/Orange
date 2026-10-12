@@ -88,6 +88,23 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(120);
 /// 出ないことはまず無い (e^-5 ≈ 0.7%)。
 const QUIET_TIP_SECS: i64 = 300;
 
+/// 名乗り合い (ハンドシェイク) を終えるまでの上限。
+///
+/// 名乗り合いの間は `ping` が動かない。上限が無いと、繋いだまま何も
+/// 送らない相手が接続を持ち続けられる (Bitcoin Core と同じ 60 秒)。
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// ヘッダの受信のレート制限 (SPEC §10.5)。溜められる数。
+///
+/// こちらが求めたときの 1 回分 ([`MAX_HEADERS`] = 2000) の 2 倍。
+const HEADER_BURST: f64 = 2.0 * MAX_HEADERS as f64;
+
+/// ヘッダの受信のレート制限。1 秒に戻る数。
+///
+/// 初期同期で 2000 件ずつ求めても、取り込むのに数秒かかるので届かない。
+/// 頼んでもいないのに速く送り続ける相手だけがここに掛かる。
+const HEADERS_PER_SEC: f64 = 1000.0;
+
 /// このノードの名乗り。
 const USER_AGENT: &str = concat!("/oag-node:", env!("CARGO_PKG_VERSION"), "/");
 
@@ -155,7 +172,13 @@ pub async fn run_as(
         .unwrap_or_else(|_| "?".to_string());
 
     let version = our_version(&handle).await?;
-    let handshake = conn.handshake(version).await;
+    let handshake = match tokio::time::timeout(HANDSHAKE_TIMEOUT, conn.handshake(version)).await {
+        Ok(result) => result,
+        Err(_) => Err(TransportError::Io(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!("no handshake within {HANDSHAKE_TIMEOUT:?}"),
+        ))),
+    };
     // こちらから繋いだ相手なら、結果を住所帳に返す。**繋がったと記録する
     // のはハンドシェイクが済んでから**である。TCP が繋がった時点で記録
     // すると、自分自身への接続が「到達できる住所」として tried に上がり、
@@ -277,6 +300,7 @@ async fn session(
         // nonce は見分けがつけばよい。推測されて困るものではない。
         liveness: Liveness::new(started, handle.nonce() ^ peer.rotate_left(32)),
         last_tip_at: started,
+        header_budget: TokenBucket::new(HEADER_BURST, HEADERS_PER_SEC, started),
     };
 
     // 相手が先を行っていれば、まずヘッダを求める。
@@ -395,6 +419,42 @@ struct Session {
     liveness: Liveness,
     /// 最後に先端が動いた時刻。誰がくれたか、自分で掘ったかは問わない。
     last_tip_at: i64,
+    /// ヘッダの受信のレート制限 (SPEC §10.5)。
+    header_budget: TokenBucket,
+}
+
+/// 一定の速さで溜まり、使うと減る枠 (トークンバケツ)。
+#[derive(Debug)]
+struct TokenBucket {
+    tokens: f64,
+    capacity: f64,
+    per_sec: f64,
+    updated_at: i64,
+}
+
+impl TokenBucket {
+    fn new(capacity: f64, per_sec: f64, now: i64) -> TokenBucket {
+        TokenBucket {
+            tokens: capacity,
+            capacity,
+            per_sec,
+            updated_at: now,
+        }
+    }
+
+    /// `n` 個使えるなら使って `true`。足りなければ使わずに `false`。
+    ///
+    /// 時計が戻ったときは溜めない (経過を 0 とみなす)。
+    fn take(&mut self, n: f64, now: i64) -> bool {
+        let elapsed = (now - self.updated_at).max(0) as f64;
+        self.tokens = (self.tokens + elapsed * self.per_sec).min(self.capacity);
+        self.updated_at = now;
+        if self.tokens < n {
+            return false;
+        }
+        self.tokens -= n;
+        true
+    }
 }
 
 /// 相手が生きているかの見張り。
@@ -475,6 +535,14 @@ const STALL_SECS: i64 = 30;
 const HEADERS_RETRY_SECS: i64 = 10;
 
 impl Session {
+    /// 相手を出入り禁止にする ([`crate::service::BAN_SECS`])。切るのは
+    /// 呼び出し側である。
+    async fn punish(&self, handle: &NodeHandle, reason: &str) {
+        if let Some(addr) = self.source {
+            let _ = handle.ban(addr.ip(), reason.to_string()).await;
+        }
+    }
+
     /// 自分が遅れていればヘッダを求める。
     async fn maybe_request_headers(
         &mut self,
@@ -678,17 +746,44 @@ impl Session {
             // 相手はもう送るものが無い。本体の取り寄せだけ進める。
             return self.request_bodies(handle, out).await;
         }
-        if let Some(last) = headers.last() {
-            self.peer_height = self.peer_height.max(last.height);
+        // 頼んでもいないのに速く送り続ける相手は切って、出入りを禁じる
+        // (SPEC §10.5)。PoW を確かめる前に見るので、CPU を使わせない。
+        if !self.header_budget.take(headers.len() as f64, now()) {
+            let reason = format!("sent {} headers faster than allowed", headers.len());
+            self.punish(handle, &reason).await;
+            return Err(reason);
         }
+        let Some(last) = headers.last().copied() else {
+            return Ok(());
+        };
+        self.peer_height = self.peer_height.max(last.height);
         let full = headers.len() >= MAX_HEADERS;
 
         // 何件取り込めたかはサービス側が出す。ここで出すと、同じ話が
         // ピアの数だけ別の口から流れる。
         let accepted = handle.accept_headers(headers).await?;
+        if let Some(reason) = accepted.invalid {
+            self.punish(handle, &reason).await;
+            return Err(format!("sent an invalid header: {reason}"));
+        }
 
         // 満杯で返ってきたなら、まだ続きがある。すぐ求める。
-        if full && accepted.new > 0 {
+        //
+        // 手元に置いただけの分 (枝の作業量が足りない) があるなら、続きは
+        // **最後に受け取ったヘッダの後から**求める。ロケータは記憶域の
+        // 枝から作るので、普段の求め方では同じ 2000 件が返り続ける。
+        if full && accepted.pending > 0 {
+            self.asked_headers_at = now();
+            send(
+                out,
+                Message::GetHeaders(GetHeaders {
+                    protocol_version: PROTOCOL_VERSION,
+                    locator: vec![last.hash()],
+                    stop: Hash::ZERO,
+                }),
+            )
+            .await?;
+        } else if full && accepted.new > 0 {
             self.asked_headers_at = now();
             self.request_headers(handle, out).await?;
         }
@@ -862,6 +957,27 @@ mod tests {
         // 返事を待っている間は、間隔が過ぎても重ねて送らない。
         let later = T0 + PING_INTERVAL_SECS + PING_INTERVAL_SECS * 2;
         assert_eq!(live.check(later), Check::Quiet);
+    }
+
+    #[test]
+    fn the_header_budget_allows_a_requested_batch_but_not_a_flood() {
+        let mut bucket = TokenBucket::new(HEADER_BURST, HEADERS_PER_SEC, T0);
+        // 求めた分 (2000 件) を 2 回続けて受け取れる。
+        assert!(bucket.take(MAX_HEADERS as f64, T0));
+        assert!(bucket.take(MAX_HEADERS as f64, T0));
+        // 3 回目は戻るまで待たされる。
+        assert!(!bucket.take(MAX_HEADERS as f64, T0));
+        // 2 秒で 2000 件ぶん戻る。
+        assert!(bucket.take(MAX_HEADERS as f64, T0 + 2));
+        // 時計が戻っても溜まらない。
+        assert!(!bucket.take(1.0, T0));
+    }
+
+    #[test]
+    fn the_header_budget_never_exceeds_its_capacity() {
+        let mut bucket = TokenBucket::new(HEADER_BURST, HEADERS_PER_SEC, T0);
+        assert!(!bucket.take(HEADER_BURST + 1.0, T0 + 1_000_000));
+        assert!(bucket.take(HEADER_BURST, T0 + 1_000_000));
     }
 
     #[test]

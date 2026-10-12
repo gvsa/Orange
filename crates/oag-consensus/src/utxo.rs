@@ -12,6 +12,7 @@
 
 use crate::codec::{write_varint, CodecError, Decode, Encode, Reader};
 use crate::tx::{OutPoint, Transaction, TxOutput};
+use crate::validate::Rules;
 use std::collections::{HashMap, HashSet};
 
 /// UTXO 1 件。
@@ -65,10 +66,21 @@ pub trait UtxoWrite: UtxoView {
 /// 呼び出し側は事前に検証を済ませていなければならない。
 /// **途中で失敗した場合、`utxo` は中途半端な状態のまま残る。**
 /// 呼び出し側が巻き戻すか、書き込みトランザクションを破棄すること。
+///
+/// `rules` は、このブロックを検証したときと同じものを渡す。
+///
+/// # UTXO に入れない出力
+///
+/// 規則が効いているブロックのコミットメント出力 (SPEC §7.7) は、UTXO に
+/// 入れず、巻き戻し情報の `created` にも載せない。載せなければ
+/// [`undo_block_from`] は触らないので、**巻き戻し情報の形は変わらない。**
+/// 入れるかどうかは [`Rules::enters_utxo`] だけで決める。検証の側
+/// (`validate::register_outputs`) も同じ関数を使う。
 pub fn apply_block_to(
     utxo: &mut dyn UtxoWrite,
     transactions: &[Transaction],
     height: u64,
+    rules: Rules,
 ) -> Result<UndoBlock, UtxoError> {
     let mut undo = UndoBlock::default();
     for tx in transactions {
@@ -84,6 +96,9 @@ pub fn apply_block_to(
             // 出力番号が u32 に収まることは MAX_TX_SIZE が保証する
             // (validate::register_outputs と同じ理由)。
             let index = u32::try_from(index).expect("MAX_TX_SIZE bounds the output count");
+            if !rules.enters_utxo(output) {
+                continue;
+            }
             let outpoint = OutPoint::new(txid, index);
             utxo.insert(
                 outpoint,
@@ -244,9 +259,10 @@ impl UtxoSet {
         &mut self,
         transactions: &[Transaction],
         height: u64,
+        rules: Rules,
     ) -> Result<UndoBlock, UtxoError> {
         let mut working = self.clone();
-        let undo = apply_block_to(&mut working, transactions, height)?;
+        let undo = apply_block_to(&mut working, transactions, height, rules)?;
         *self = working;
         Ok(undo)
     }
@@ -359,13 +375,17 @@ mod tests {
     fn apply_and_undo_restore_the_original_state() {
         let mut set = UtxoSet::new();
         let cb = coinbase(1);
-        let undo1 = set.apply_block(std::slice::from_ref(&cb), 1).unwrap();
+        let undo1 = set
+            .apply_block(std::slice::from_ref(&cb), 1, Rules::NONE)
+            .unwrap();
         let after_first = set.clone();
         assert_eq!(set.len(), 1);
 
         let cb_out = OutPoint::new(cb.txid(), 0);
         let tx = spend(cb_out, Amount::from_oag(9).unwrap());
-        let undo2 = set.apply_block(&[coinbase(2), tx.clone()], 2).unwrap();
+        let undo2 = set
+            .apply_block(&[coinbase(2), tx.clone()], 2, Rules::NONE)
+            .unwrap();
         assert_eq!(
             set.len(),
             2,
@@ -388,7 +408,8 @@ mod tests {
     fn a_chain_spent_within_one_block_can_be_undone() {
         let mut set = UtxoSet::new();
         let cb = coinbase(1);
-        set.apply_block(std::slice::from_ref(&cb), 1).unwrap();
+        set.apply_block(std::slice::from_ref(&cb), 1, Rules::NONE)
+            .unwrap();
         let after_first = set.clone();
 
         let cb_out = OutPoint::new(cb.txid(), 0);
@@ -396,7 +417,9 @@ mod tests {
         let mid = OutPoint::new(parent.txid(), 0);
         let child = spend(mid, Amount::from_oag(8).unwrap());
         let paid = OutPoint::new(child.txid(), 0);
-        let undo = set.apply_block(&[coinbase(2), parent, child], 2).unwrap();
+        let undo = set
+            .apply_block(&[coinbase(2), parent, child], 2, Rules::NONE)
+            .unwrap();
         assert!(!set.contains(&cb_out).unwrap());
         assert!(!set.contains(&mid).unwrap(), "spent in the same block");
         assert!(set.contains(&paid).unwrap());
@@ -408,11 +431,76 @@ mod tests {
         assert!(!set.contains(&paid).unwrap());
     }
 
+    /// 規則が効いているブロックのコミットメント出力は、UTXO にも巻き戻し
+    /// 情報にも入らない。巻き戻すと、他の出力だけが元に戻る。
+    #[test]
+    fn a_commitment_never_enters_the_set_once_active_and_undo_stays_symmetric() {
+        let mut set = UtxoSet::new();
+        let cb = coinbase(1);
+        set.apply_block(std::slice::from_ref(&cb), 1, Rules::NONE)
+            .unwrap();
+        let before = set.clone();
+
+        let cb_out = OutPoint::new(cb.txid(), 0);
+        let mut parent = spend(cb_out, Amount::from_oag(9).unwrap());
+        parent.outputs.push(TxOutput::new(
+            Amount::ZERO,
+            Lock::commitment(b"orange".to_vec()).unwrap(),
+        ));
+        let pay = OutPoint::new(parent.txid(), 0);
+        let note = OutPoint::new(parent.txid(), 1);
+        // 0.4.3 と同じ形も混ぜる: 親の支払いを子が同じブロックで使う。
+        let child = spend(pay, Amount::from_oag(8).unwrap());
+        let paid = OutPoint::new(child.txid(), 0);
+
+        let mut cb2 = coinbase(2);
+        cb2.outputs.push(TxOutput::new(
+            Amount::ZERO,
+            Lock::commitment(vec![1; 32]).unwrap(),
+        ));
+        let cb2_note = OutPoint::new(cb2.txid(), 1);
+
+        let undo = set
+            .apply_block(&[cb2, parent, child], 2, Rules::ALL)
+            .unwrap();
+        assert!(!set.contains(&note).unwrap(), "a commitment is not a coin");
+        assert!(!set.contains(&cb2_note).unwrap());
+        assert!(!set.contains(&pay).unwrap(), "spent in the same block");
+        assert!(set.contains(&paid).unwrap());
+        // 作った出力は、コインベースの支払い・親の支払い・子の支払いの 3 つ。
+        assert_eq!(undo.created_count(), 3);
+        assert!(!undo.created.contains(&note));
+        assert!(!undo.created.contains(&cb2_note));
+
+        set.undo_block(&undo).unwrap();
+        assert_eq!(set, before);
+    }
+
+    /// 規則が効く前のブロックでは、版数 3 も他の未知の版数と同じく入る。
+    #[test]
+    fn a_commitment_enters_the_set_before_activation() {
+        let mut set = UtxoSet::new();
+        let mut cb = coinbase(1);
+        cb.outputs.push(TxOutput::new(
+            Amount::ZERO,
+            Lock::commitment(vec![2; 2]).unwrap(),
+        ));
+        let note = OutPoint::new(cb.txid(), 1);
+        let undo = set
+            .apply_block(std::slice::from_ref(&cb), 1, Rules::NONE)
+            .unwrap();
+        assert!(set.contains(&note).unwrap());
+        assert_eq!(undo.created_count(), 2);
+        set.undo_block(&undo).unwrap();
+        assert!(set.is_empty());
+    }
+
     #[test]
     fn undo_records_both_directions() {
         let mut set = UtxoSet::new();
         let cb = coinbase(1);
-        set.apply_block(std::slice::from_ref(&cb), 1).unwrap();
+        set.apply_block(std::slice::from_ref(&cb), 1, Rules::NONE)
+            .unwrap();
 
         let undo = set
             .apply_block(
@@ -421,6 +509,7 @@ mod tests {
                     spend(OutPoint::new(cb.txid(), 0), Amount::from_oag(9).unwrap()),
                 ],
                 2,
+                Rules::NONE,
             )
             .unwrap();
         assert_eq!(undo.spent_count(), 1);
@@ -431,7 +520,8 @@ mod tests {
     fn entries_record_height_and_coinbase_flag() {
         let mut set = UtxoSet::new();
         let cb = coinbase(42);
-        set.apply_block(std::slice::from_ref(&cb), 42).unwrap();
+        set.apply_block(std::slice::from_ref(&cb), 42, Rules::NONE)
+            .unwrap();
         let entry = set.get(&OutPoint::new(cb.txid(), 0)).unwrap().unwrap();
         assert_eq!(entry.height, 42);
         assert!(entry.is_coinbase);
@@ -443,7 +533,7 @@ mod tests {
         let ghost = OutPoint::new(oag_primitives::hash::txid(b"ghost"), 0);
         let before = set.len();
         assert_eq!(
-            set.apply_block(&[spend(ghost, Amount::ONE_OAG)], 1),
+            set.apply_block(&[spend(ghost, Amount::ONE_OAG)], 1, Rules::NONE),
             Err(UtxoError::MissingUtxo(ghost))
         );
         assert_eq!(set.len(), before, "the set is left unchanged on failure");
@@ -453,7 +543,8 @@ mod tests {
     fn a_block_that_fails_midway_leaves_the_set_untouched() {
         let mut set = UtxoSet::new();
         let cb = coinbase(1);
-        set.apply_block(std::slice::from_ref(&cb), 1).unwrap();
+        set.apply_block(std::slice::from_ref(&cb), 1, Rules::NONE)
+            .unwrap();
         let snapshot = set.clone();
 
         let ghost = OutPoint::new(oag_primitives::hash::txid(b"ghost"), 0);
@@ -464,6 +555,7 @@ mod tests {
                 spend(ghost, Amount::ONE_OAG),
             ],
             2,
+            Rules::NONE,
         );
         assert!(result.is_err());
         assert_eq!(set.len(), snapshot.len());
@@ -474,7 +566,8 @@ mod tests {
     fn overlay_sees_outputs_created_in_the_same_block() {
         let mut set = UtxoSet::new();
         let cb = coinbase(1);
-        set.apply_block(std::slice::from_ref(&cb), 1).unwrap();
+        set.apply_block(std::slice::from_ref(&cb), 1, Rules::NONE)
+            .unwrap();
 
         let mut overlay = OverlayView::new(&set);
         let base_out = OutPoint::new(cb.txid(), 0);

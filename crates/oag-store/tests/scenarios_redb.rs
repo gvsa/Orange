@@ -85,3 +85,13 @@ scenario!(the_difficulty_rises_when_blocks_come_too_fast);
 
 // 相対 locktime の強制開始
 scenario!(relative_locktime_starts_at_its_height, two);
+
+// 採掘者の印による有効化と、コミットメント出力・署名の 0x00 の規則
+scenario!(signals_lock_in_and_then_activate_the_rules);
+scenario!(too_few_signals_time_out);
+scenario!(a_reorg_across_the_activation_follows_each_branch, two);
+scenario!(the_activation_state_needs_only_headers, two);
+
+// 軽い枝を記憶域に書かない
+scenario!(light_branch_headers_wait_in_memory_until_heavy);
+scenario!(a_deep_but_heavier_branch_still_wins);

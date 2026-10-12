@@ -16,7 +16,7 @@ use oag_primitives::{Address, Amount, Hash, Network};
 use oag_rpc::auth::read_cookie;
 use oag_rpc::client::Client;
 use oag_wallet::bip39::Mnemonic;
-use oag_wallet::build::{build, consolidate, sign, Coin, Consolidate, Spend};
+use oag_wallet::build::{build, commit, consolidate, sign, Coin, Commit, Consolidate, Spend};
 use oag_wallet::keystore::{Keystore, MIN_PASSPHRASE_LEN};
 use oag_wallet::pst::Pst;
 use serde_json::{json, Value};
@@ -184,6 +184,19 @@ enum Command {
         /// The maximum inputs in one transaction. Without it, as many as fit.
         #[arg(long)]
         max_inputs: Option<usize>,
+        /// Build it but do not send.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Record up to 40 bytes on the chain (a commitment output).
+    ///
+    /// It makes one output that carries 0 OAG and the given bytes, usually a
+    /// hash (a timestamp, a release proof, a key-handover notice). **Nobody can
+    /// spend it**, and only the fee is paid. It is refused until the soft fork
+    /// that defines it is active (`oag-wallet info` shows `softfork.state`).
+    Commit {
+        /// The bytes to record, in hex (2 to 40 bytes).
+        data: String,
         /// Build it but do not send.
         #[arg(long)]
         dry_run: bool,
@@ -784,6 +797,71 @@ async fn run() -> Result<(), String> {
                 println!("--dry-run, so nothing is sent. Raw transaction:");
                 println!("{}", to_hex(&raw));
                 return Ok(());
+            }
+
+            let txid = client
+                .call("sendrawtransaction", json!([to_hex(&raw)]))
+                .await
+                .map_err(|e| format!("the send was refused: {e}"))?;
+            println!();
+            println!("sent: {}", as_str(&txid, "txid")?);
+            Ok(())
+        }
+
+        Command::Commit { data, dry_run } => {
+            let payload = from_hex(&data)?;
+            let pass = passphrase(&cli.common.passphrase_file, "passphrase: ")?;
+            let store =
+                Keystore::open(&cli.common.wallet, network, &pass).map_err(|e| e.to_string())?;
+
+            let client = cli.common.client(network)?;
+            // **有効化の前は送らない** (SPEC §10.9)。ノードは中継しないし、
+            // 有効化の前の版数 3 は誰でも使える出力で、刻んだことにならない。
+            let info = client
+                .call("getinfo", json!([]))
+                .await
+                .map_err(|e| e.to_string())?;
+            let state = info
+                .get("softfork")
+                .and_then(|f| f.get("state"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown")
+                .to_string();
+            let height = block_count(&client).await?;
+            let coins = scan(&client, &store).await?;
+
+            let order = Commit {
+                payload: payload.clone(),
+                change_to: Lock::from_address(&store.default_address().map_err(|e| e.to_string())?),
+                next_height: height + 1,
+                fee_rate: params::MIN_RELAY_FEE_RATE_PER_BYTE,
+            };
+            let draft = commit(&coins, &order).map_err(|e| e.to_string())?;
+            let signed = sign(&draft, |lock| store.key_for(lock)).map_err(|e| e.to_string())?;
+            let raw = signed.encode();
+
+            println!(
+                "  commitment     {} ({} bytes)",
+                to_hex(&payload),
+                payload.len()
+            );
+            println!("  fee            {} OAG", draft.fee);
+            println!("  change         {} OAG", draft.change);
+            println!("  inputs         {}", draft.spent.len());
+            println!("  size           {} bytes", raw.len());
+            println!("  txid          {}", signed.txid());
+            println!("  soft fork      {state}");
+
+            if dry_run {
+                println!();
+                println!("--dry-run, so nothing is sent. Raw transaction:");
+                println!("{}", to_hex(&raw));
+                return Ok(());
+            }
+            if state != "active" {
+                return Err(format!(
+                    "the soft fork for commitments is {state}, not active yet; nothing was sent"
+                ));
             }
 
             let txid = client
