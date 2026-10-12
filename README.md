@@ -735,11 +735,11 @@ m / 44' / <coin_type>' / 0' / 0 / <index>
 > paper and keep it somewhere safe. Encryption will not save you if the
 > passphrase is weak.
 
-> **Do not put funds on a mainnet address yet.** mainnet's coin_type is 1033,
-> but the SLIP-0044 registration is **still under review**. If a different
-> number is accepted, the derivation path changes and so do the addresses
-> produced from the same phrase. Test the wallet on testnet and regtest
-> (reserved number 1) instead ([SPEC §6.6](docs/SPEC.md)).
+> **mainnet's coin_type 1033 is not final yet.** The SLIP-0044 registration
+> is **still under review**. If a different number is accepted, new versions
+> of the wallet **will keep reading the old path (1033)** and offer a way to
+> move the funds to the new one ([SPEC §6.6](docs/SPEC.md)). Your recovery
+> phrase stays valid either way, so keep it safe.
 
 To use a BIP39 passphrase, pass `--mnemonic-passphrase`. **A typo does not
 surface as an error.** A different passphrase simply produces a different wallet
